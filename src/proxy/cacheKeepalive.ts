@@ -15,6 +15,11 @@
  * previous mapping warm. Its start time still counts for both: it read the old
  * prefix and wrote the new one when it began.
  *
+ * A newly published session is left alone briefly. A turn that ran for most of
+ * the TTL publishes inside the lead, and a client in a tool loop sends its next
+ * turn seconds later; a keepalive in between only duplicates that turn's cache
+ * write. The client's request moves the anchor first, so no keepalive is due.
+ *
  * Pure scheduling: no SDK, HTTP or I/O. The caller resolves the current
  * mapping and runs each keepalive.
  */
@@ -26,6 +31,9 @@ export const PROMPT_CACHE_TTL_MS = 5 * 60_000
 
 /** Refresh this long before the prefix would expire. */
 export const CACHE_KEEPALIVE_LEAD_MS = 60_000
+
+/** Quiet period after a newly published session before it may be refreshed. */
+export const CACHE_KEEPALIVE_SETTLE_MS = 15_000
 
 /** Back-off after a keepalive that never reached upstream. */
 export const CACHE_KEEPALIVE_RETRY_MS = 30_000
@@ -63,6 +71,8 @@ export interface CacheKeepaliveState {
   lastBeat?: { sessionId: string; at: number }
   /** Earliest retry after a keepalive that never reached upstream. */
   retryAt?: number
+  /** When a tick first saw the mapping move to this SDK session. */
+  sessionSeen?: { sessionId: string; at: number }
 }
 
 export type CacheKeepaliveDecision = "wait" | "beat" | "expire"
@@ -82,6 +92,7 @@ export function decideCacheKeepalive(
   now: number,
   ttlMs: number = PROMPT_CACHE_TTL_MS,
   leadMs: number = CACHE_KEEPALIVE_LEAD_MS,
+  settleMs: number = CACHE_KEEPALIVE_SETTLE_MS,
 ): CacheKeepaliveDecision {
   if (now >= state.windowEndsAt) return "expire"
   if (!currentSessionId) return "wait"
@@ -91,6 +102,7 @@ export function decideCacheKeepalive(
   if (now >= anchor + ttlMs) return "expire"
   if (now < anchor + ttlMs - leadMs) return "wait"
   if (state.retryAt !== undefined && now < state.retryAt) return "wait"
+  if (state.sessionSeen?.sessionId === currentSessionId && now < state.sessionSeen.at + settleMs) return "wait"
   return "beat"
 }
 
@@ -102,6 +114,7 @@ export interface CacheKeepaliveSchedulerOptions<R> {
   now?: () => number
   ttlMs?: number
   leadMs?: number
+  settleMs?: number
   retryMs?: number
 }
 
@@ -109,6 +122,8 @@ interface Entry<R> {
   recipe: R
   state: CacheKeepaliveState
   running?: AbortController
+  /** The session the previous tick saw, so a newly published one is noticed. */
+  observed?: { sessionId: string | undefined }
 }
 
 /** Tracks opted-in sessions and starts their keepalives when `tick` finds one due. */
@@ -150,6 +165,7 @@ export class CacheKeepaliveScheduler<R> {
     if (this.stopped) return
     const ttlMs = this.options.ttlMs ?? PROMPT_CACHE_TTL_MS
     const leadMs = this.options.leadMs ?? CACHE_KEEPALIVE_LEAD_MS
+    const settleMs = this.options.settleMs ?? CACHE_KEEPALIVE_SETTLE_MS
     for (const [key, entry] of this.entries) {
       if (entry.running) continue
       const now = this.now()
@@ -160,7 +176,11 @@ export class CacheKeepaliveScheduler<R> {
         // An unreadable mapping is retried on the next tick.
         continue
       }
-      const decision = decideCacheKeepalive(entry.state, sessionId, now, ttlMs, leadMs)
+      if (sessionId && entry.observed && entry.observed.sessionId !== sessionId) {
+        entry.state.sessionSeen = { sessionId, at: now }
+      }
+      entry.observed = { sessionId }
+      const decision = decideCacheKeepalive(entry.state, sessionId, now, ttlMs, leadMs, settleMs)
       if (decision === "expire") {
         this.entries.delete(key)
       } else if (decision === "beat" && sessionId) {

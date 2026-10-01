@@ -689,7 +689,8 @@ generated.
 - Keepalives never change the session. They are not saved, so the next turn
   resumes the same transcript it would have without them.
 - While a turn is still generating, keepalives refresh the previous turn's
-  cache. The new prefix is used once that turn has finished.
+  cache. The new prefix is used once that turn has finished, after a
+  15-second pause that lets the client's next turn refresh it instead.
 - A keepalive is skipped when the cache has already expired, and at a tool
   checkpoint with more than eight pending tool calls, where it could not reuse
   the cache.

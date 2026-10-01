@@ -66,6 +66,14 @@ describe("decideCacheKeepalive", () => {
     expect(decideCacheKeepalive(later, "s1", 7 * MIN, TTL, LEAD)).toBe("beat")
   })
 
+  it("waits out the settle period after the mapping moves to a new session", () => {
+    const seen = { ...state, sessionSeen: { sessionId: "s1", at: TTL - LEAD } }
+    expect(decideCacheKeepalive(seen, "s1", TTL - LEAD + 14_999, TTL, LEAD, 15_000)).toBe("wait")
+    expect(decideCacheKeepalive(seen, "s1", TTL - LEAD + 15_000, TTL, LEAD, 15_000)).toBe("beat")
+    // The settle belongs to the session that was published, not a later one.
+    expect(decideCacheKeepalive(seen, "s2", TTL - LEAD + 1, TTL, LEAD, 15_000)).toBe("beat")
+  })
+
   it("holds off until the retry time after a failed keepalive", () => {
     const failed = { ...state, retryAt: TTL - LEAD + 30_000 }
     expect(decideCacheKeepalive(failed, "s1", TTL - LEAD, TTL, LEAD)).toBe("wait")
@@ -177,9 +185,13 @@ describe("CacheKeepaliveScheduler", () => {
     h.scheduler.tick()
     expect(h.beats.map(b => b.sessionId)).toEqual(["s1"])
     await h.settleAll()
-    // It publishes at 5.5m. Its prefix was written at 1m, so it is due now.
+    // It publishes at 5.5m. Its prefix was written at 1m, so it is due once
+    // the client has had the settle period to send its next turn instead.
     h.publish("s2")
     h.at(5.5 * MIN)
+    h.scheduler.tick()
+    expect(h.beats.map(b => b.sessionId)).toEqual(["s1"])
+    h.at(5.5 * MIN + 15_000)
     h.scheduler.tick()
     expect(h.beats.map(b => b.sessionId)).toEqual(["s1", "s2"])
   })
@@ -199,4 +211,33 @@ describe("CacheKeepaliveScheduler", () => {
     h.scheduler.tick()
     expect(h.beats).toHaveLength(1)
   })
+  it("leaves a long first turn's session to the client's immediate next turn", () => {
+    // 9/30 trace: a first turn started at 0, ran almost the whole TTL and
+    // published inside the lead; the client sent its next turn 2 s later.
+    const h = harness()
+    h.publish(undefined)
+    h.scheduler.noteRequest("k", "r", 30 * MIN, 0)
+    for (let t = 0; t < 4 * MIN + 50_000; t += 10_000) { h.at(t); h.scheduler.tick() }
+    h.publish("s1")
+    h.at(4 * MIN + 58_000)
+    h.scheduler.tick()
+    h.scheduler.noteRequest("k", "r", 30 * MIN, 4 * MIN + 60_000)
+    for (let t = 5 * MIN; t < 8 * MIN; t += 10_000) { h.at(t); h.scheduler.tick() }
+    expect(h.beats).toHaveLength(0)
+  })
+
+  it("still refreshes a newly published session the client leaves idle", () => {
+    const h = harness()
+    h.publish(undefined)
+    h.scheduler.noteRequest("k", "r", 30 * MIN, 0)
+    h.at(3 * MIN + 50_000)
+    h.scheduler.tick()
+    h.publish("s1")
+    for (const t of [4 * MIN, 4 * MIN + 10_000]) { h.at(t); h.scheduler.tick() }
+    expect(h.beats).toHaveLength(0)
+    h.at(4 * MIN + 20_000)
+    h.scheduler.tick()
+    expect(h.beats.map(b => b.sessionId)).toEqual(["s1"])
+  })
 })
+

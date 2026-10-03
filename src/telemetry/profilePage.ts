@@ -5,6 +5,7 @@
 
 import { profileBarCss, profileBarHtml, profileBarJs, themeCss } from "./profileBar"
 import { profileFactsJs } from "./profileFacts"
+import { profileFindJs } from "./profileFind"
 import { reorderClientJs, reorderCss, reorderLiveRegionHtml } from "./profileOrder"
 import { WINDOW_LABELS } from "./profileUsage"
 
@@ -14,6 +15,7 @@ export const profilePageHtml = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meridian — Profiles</title>
+<link rel="icon" type="image/svg+xml" href="/telemetry/icon.svg">
 <style>
   ${themeCss}
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -26,44 +28,89 @@ export const profilePageHtml = `<!DOCTYPE html>
   .section-title { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
                    letter-spacing: 0.5px; margin-bottom: 12px; }
 
+  .profile-search { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .profile-search[hidden] { display: none; }
+  .profile-search input {
+    flex: 1 1 260px; min-width: 0; padding: 8px 12px; border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    font-family: inherit; font-size: 13px;
+  }
+  .profile-search input::placeholder { color: var(--muted); }
+  .profile-search input:focus { outline: none; border-color: var(--accent); }
+  .profile-search-count { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .profile-no-match { padding: 32px; }
+  .profile-no-match[hidden] { display: none; }
+  .link-btn {
+    background: none; border: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer;
+  }
+  .link-btn:hover { text-decoration: underline; }
+  /* Reordering a filtered list would move cards past ones nobody can see. */
+  .filtering .drag-handle, .filtering .order-index, .filtering .order-note { display: none; }
+
   .profile-card {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
     padding: 20px; margin-bottom: 12px; transition: border-color 0.2s;
   }
+  .profile-card[hidden] { display: none; }
+  /* Arriving from a /profiles#<name> link: one short pulse says which card. */
+  .profile-card.anchor-flash { animation: profile-anchor-flash 0.5s ease-out; }
+  @keyframes profile-anchor-flash {
+    0% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
+    35% { box-shadow: 0 0 0 4px rgba(88,166,255,0.35); background: rgba(88,166,255,0.12); }
+    100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); background: var(--surface); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .profile-card.anchor-flash { animation: none; }
+  }
+  /* The name links to its own card. */
+  a.profile-name { color: inherit; text-decoration: none; }
+  a.profile-name:hover { color: var(--accent); }
   .profile-card.active { border-color: var(--accent); }
-  .profile-card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  /* The header row carries the reorder handle, the name, every badge the
+     card can earn - active, the type, out of a limit - and the actions. On a
+     phone they do not fit on one line, and a row that cannot wrap pushed the
+     actions past the card's edge and scrolled the whole page sideways. The
+     row wraps, a long name may break anywhere, and the actions stay
+     right-aligned, on their own line once nothing else fits beside them.
+     When everything fits on one line, as on a desktop, none of this changes
+     the layout. */
+  .profile-card-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 12px; }
   ${reorderCss}
-  .profile-name { font-size: 16px; font-weight: 600; }
-  .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .profile-name { font-size: 16px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+  .profile-card-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .icon-btn {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border);
     border-radius: 4px; padding: 4px 6px; cursor: pointer; display: inline-flex;
-    align-items: center; transition: all 0.15s;
+    align-items: center; transition: all 0.15s; flex-shrink: 0;
   }
   .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
   .rename-input {
     background: var(--surface2); color: var(--text); border: 1px solid var(--accent);
     border-radius: 6px; padding: 4px 8px; font-size: 14px; font-weight: 600;
-    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; width: 200px;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; width: 200px; max-width: 100%;
   }
   .rename-input:focus { outline: none; }
   .rename-hint { font-size: 11px; color: var(--muted); }
   .rename-error { font-size: 12px; color: var(--red); margin-bottom: 12px; }
   .profile-badge {
     font-size: 10px; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;
-    letter-spacing: 0.5px; font-weight: 500;
+    letter-spacing: 0.5px; font-weight: 500; min-width: 0; overflow-wrap: anywhere;
   }
   .badge-active { background: rgba(88,166,255,0.15); color: var(--accent); }
   .badge-type { background: var(--bg); color: var(--muted); border: 1px solid var(--border); }
   .badge-spent { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.35); }
   .spent-note { margin: 10px 0; padding: 10px 14px; border-radius: 8px; font-size: 12px; line-height: 1.5;
-    background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text); }
+    background: rgba(248,81,73,0.08); border: 1px solid rgba(248,81,73,0.3); color: var(--text);
+    overflow-wrap: anywhere; }
   .spent-note .spent-why { color: var(--muted); }
+  /* minmax(0, 1fr), not 1fr: a bare fr track is at least as wide as its
+     longest unbreakable value, so an email address widened the grid past
+     the card instead of wrapping. */
   .profile-details {
-    display: grid; grid-template-columns: 120px 1fr; gap: 6px 16px; font-size: 13px;
+    display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 6px 16px; font-size: 13px;
   }
   .detail-label { color: var(--muted); }
-  .detail-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .detail-value { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
   .cached-tag { color: var(--muted); font-size: 10px; font-style: italic; margin-left: 6px; white-space: nowrap; }
   .detail-unknown { color: var(--muted); font-style: italic; }
   .status-ok { color: var(--green); }
@@ -71,7 +118,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .switch-btn {
     margin-top: 12px; padding: 6px 16px; font-size: 12px; font-weight: 500;
     background: var(--bg); color: var(--accent); border: 1px solid var(--accent);
-    border-radius: 6px; cursor: pointer; transition: all 0.15s;
+    border-radius: 6px; cursor: pointer; transition: all 0.15s; max-width: 100%; overflow-wrap: anywhere;
   }
   .switch-btn:hover { background: rgba(88,166,255,0.1); }
   .switch-btn:disabled { opacity: 0.4; cursor: default; }
@@ -82,6 +129,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
   }
   .empty-state h2 { font-size: 16px; margin-bottom: 8px; color: var(--text); }
+  .empty-state code { max-width: 100%; overflow-wrap: anywhere; }
 
   .guide {
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -105,6 +153,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
     background: var(--bg); padding: 4px 10px; border-radius: 4px; color: var(--accent2);
     cursor: pointer; border: 1px solid var(--border); transition: border-color 0.15s;
+    min-width: 0; overflow-wrap: anywhere;
   }
   .copy-btn {
     background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -118,12 +167,12 @@ export const profilePageHtml = `<!DOCTYPE html>
   .usage-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
   .usage-section-title {
     font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;
-    margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
+    margin-bottom: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   }
   .usage-as-of { font-size: 10px; color: var(--muted); text-transform: none; letter-spacing: 0; opacity: 0.7; }
   .usage-stale-note { font-size: 11px; color: var(--yellow); line-height: 1.4; margin: -2px 0 10px; }
   .usage-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
     gap: 8px;
   }
   .usage-card {
@@ -134,7 +183,7 @@ export const profilePageHtml = `<!DOCTYPE html>
     display: flex; justify-content: space-between; align-items: baseline;
     font-size: 11px; gap: 8px; margin-bottom: 6px;
   }
-  .usage-label { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  .usage-label { color: var(--muted); font-weight: 500; min-width: 0; overflow-wrap: anywhere; }
   .usage-pct { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-weight: 600; font-size: 12px; }
   .usage-bar {
     height: 4px; background: rgba(127,127,127,0.18); border-radius: 2px; overflow: hidden;
@@ -156,6 +205,14 @@ export const profilePageHtml = `<!DOCTYPE html>
   .usage-empty {
     font-size: 11px; color: var(--muted); padding: 6px 0; font-style: italic;
   }
+  /* A phone leaves a card about 230px inside: beside a 120px label column an
+     email would wrap every few characters, so each label sits above its
+     value instead. */
+  @media (max-width: 480px) {
+    .profile-details { grid-template-columns: minmax(0, 1fr); row-gap: 0; }
+    .detail-value { margin-bottom: 6px; }
+    .empty-state { padding: 32px 16px; }
+  }
 ` + profileBarCss + `
 </style>
 </head>
@@ -165,11 +222,26 @@ export const profilePageHtml = `<!DOCTYPE html>
 <h1>Profiles</h1>
 <div class="subtitle">Manage Claude account profiles</div>
 
-<div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading\u2026</div></div>
+<!-- The heading and search box sit outside #content, which render() rebuilds
+     on every poll: a box inside it would lose its text every ten seconds. -->
+<div class="section" id="profiles-section">
+  <h2 class="section-title">Configured Profiles</h2>
+  <div class="profile-search" id="profiles-filter-bar" hidden>
+    <input type="search" id="profiles-filter" autocomplete="off" spellcheck="false"
+      aria-label="Filter profiles" aria-controls="content"
+      placeholder="Filter by name, email, organization, plan (5x, 20x, max) or former name">
+    <span class="profile-search-count" id="profiles-filter-count" aria-live="polite"></span>
+  </div>
+  <div id="content"><div style="color:var(--muted);padding:40px;text-align:center">Loading\u2026</div></div>
+  <div class="empty-state profile-no-match" id="profiles-no-match" hidden>
+    No profile matches <strong id="profiles-no-match-query"></strong>.
+    <button type="button" class="link-btn" onclick="setProfileQuery('')">Clear the search</button>
+  </div>
+</div>
 ${reorderLiveRegionHtml}
 
 <div class="section" style="margin-top:32px">
-  <div class="section-title">Setup Guide</div>
+  <h2 class="section-title">Setup Guide</h2>
   <div class="guide">
     <h3>How profiles work</h3>
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
@@ -216,7 +288,7 @@ ${reorderLiveRegionHtml}
 </div>
 
 <script>
-` + profileFactsJs + `
+` + profileFactsJs + profileFindJs + `
 // Inlined from src/telemetry/profileUsage.ts. The TS source is unit-tested
 // (see profile-usage.test.ts) and the labels object is interpolated here so
 // the browser script and TS module share their data.
@@ -554,18 +626,19 @@ function render(data, quotaData) {
       + '<p style="margin-top:8px">Add your first profile from the terminal:</p>'
       + '<p style="margin-top:8px"><code class="mono" style="background:var(--bg);padding:8px 16px;border-radius:6px;display:inline-block">meridian profile add personal</code></p>'
       + '</div>';
+    afterRender();
     return;
   }
 
   const reorderable = profiles.length > 1 && !meridianReorder.envPinned();
 
-  let html = '<div class="section"><div class="section-title">Configured Profiles</div>';
+  let html = '';
   if (profiles.length > 1) html += meridianReorder.noteHtml(reorderable);
 
   for (let idx = 0; idx < profiles.length; idx++) {
     const p = profiles[idx];
     const isActive = p.id === active;
-    html += '<div class="profile-card' + (isActive ? ' active' : '') + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
+    html += '<div class="profile-card' + (isActive ? ' active' : '') + '" id="' + esc(profileAnchorElementId(p.id)) + '" data-id="' + esc(p.id) + '" data-index="' + idx + '">';
     html += '<div class="profile-card-header">';
     if (editingProfile === p.id) {
       html += "<input class=\\"rename-input\\" id=\\"rename-input\\" value=\\"" + esc(p.id) + "\\" spellcheck=\\"false\\" autocomplete=\\"off\\""
@@ -578,7 +651,7 @@ function render(data, quotaData) {
       html += "</span>";
     } else {
       if (reorderable) html += meridianReorder.handleHtml(p.id, idx, profiles.length);
-      html += "<span class=\\"profile-name\\">" + esc(p.id) + "</span>";
+      html += "<a class=\\"profile-name\\" href=\\"#" + esc(encodeURIComponent(p.id)) + "\\" title=\\"Link to this profile\\">" + esc(p.id) + "</a>";
       if (isActive) html += "<span class=\\"profile-badge badge-active\\">active</span>";
       html += "<span class=\\"profile-badge badge-type\\">" + esc(p.type || "claude-max") + "</span>";
       html += renderSpentBadge((quotaById[p.id] || {}).spent);
@@ -620,10 +693,124 @@ function render(data, quotaData) {
     html += '</div>';
   }
 
-  html += '</div>';
   document.getElementById('content').innerHTML = html;
   meridianReorder.restoreFocus(refocusId);
+  afterRender();
 }
+
+// The search and the #anchor both act on the cards render() just drew, so
+// they run after every render. Both change only visibility and scroll, never
+// the markup, so they cannot wipe a panel or input the poll is protecting.
+function afterRender() {
+  applyProfileFilter();
+  if (anchorPending && lastProfiles) {
+    anchorPending = false;
+    jumpToProfileAnchor();
+  }
+}
+
+var profileQuery = '';
+// Set on load and on hashchange; consumed by the first render with data, so
+// the 10s poll never yanks the page back to the card after someone scrolls.
+var anchorPending = !!location.hash;
+
+function profilesForFind() {
+  return (lastProfiles && Array.isArray(lastProfiles.profiles)) ? lastProfiles.profiles : [];
+}
+
+function writeProfilesUrl(hashId) {
+  var url = new URL(location.href);
+  if (profileQueryTerms(profileQuery).length > 0) url.searchParams.set('q', profileQuery);
+  else url.searchParams.delete('q');
+  if (hashId) url.hash = encodeURIComponent(hashId);
+  if (url.toString() !== location.href) history.replaceState(history.state, '', url.toString());
+}
+
+function applyProfileFilter() {
+  var profiles = profilesForFind();
+  var byId = Object.create(null);
+  for (var i = 0; i < profiles.length; i++) byId[profiles[i].id] = profiles[i];
+  var cards = document.querySelectorAll('#content .profile-card[data-id]');
+  var shown = 0;
+  for (var c = 0; c < cards.length; c++) {
+    var match = profileMatchesQuery(byId[cards[c].getAttribute('data-id')], profileQuery);
+    cards[c].hidden = !match;
+    if (match) shown++;
+  }
+  var filtering = profileQueryTerms(profileQuery).length > 0;
+  document.getElementById('profiles-section').classList.toggle('filtering', filtering);
+  document.getElementById('profiles-filter-bar').hidden = cards.length === 0 && !filtering;
+  var paused = filtering && document.querySelector('#content .drag-handle') ? ' \u00b7 clear to reorder' : '';
+  document.getElementById('profiles-filter-count').textContent = filtering
+    ? shown + ' of ' + cards.length + paused
+    : '';
+  document.getElementById('profiles-no-match-query').textContent = profileQuery.trim();
+  document.getElementById('profiles-no-match').hidden = !(filtering && cards.length > 0 && shown === 0);
+}
+
+function setProfileQuery(query) {
+  profileQuery = String(query || '');
+  var input = document.getElementById('profiles-filter');
+  if (input.value !== profileQuery) input.value = profileQuery;
+  applyProfileFilter();
+  writeProfilesUrl(null);
+}
+
+// Scrolls under the sticky header rather than behind it; the header wraps to
+// several rows on a phone, so its height is measured, not assumed.
+function alignProfileCard(card) {
+  var header = document.querySelector('.meridian-header');
+  var offset = (header ? header.getBoundingClientRect().height : 0) + 12;
+  window.scrollTo({ top: Math.max(0, card.getBoundingClientRect().top + window.scrollY - offset) });
+}
+
+// The header can still grow after the jump - its chips load on their own
+// fetches and wrap to another row on a phone - and scroll anchoring then keeps
+// the card where it was, now underneath. So a resize shortly after a jump
+// re-aligns, until the reader scrolls on their own.
+var anchorHold = null;
+function releaseAnchorHold() { anchorHold = null; }
+['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (type) {
+  window.addEventListener(type, releaseAnchorHold, { passive: true });
+});
+if (window.ResizeObserver) {
+  var profilesHeader = document.querySelector('.meridian-header');
+  if (profilesHeader) new ResizeObserver(function () {
+    if (!anchorHold || Date.now() > anchorHold.until || !anchorHold.card.isConnected) return;
+    alignProfileCard(anchorHold.card);
+  }).observe(profilesHeader);
+}
+
+function jumpToProfileAnchor() {
+  var id = resolveProfileAnchor(location.hash, profilesForFind());
+  if (!id) return;
+  var card = document.getElementById(profileAnchorElementId(id));
+  if (!card) return;
+  // Following a link to one profile outranks a filter that hides it.
+  if (card.hidden) setProfileQuery('');
+  // A former name, or different casing, becomes the name the card shows.
+  if (profileIdFromHash(location.hash) !== id) writeProfilesUrl(id);
+  alignProfileCard(card);
+  anchorHold = { card: card, until: Date.now() + 5000 };
+  card.classList.remove('anchor-flash');
+  void card.offsetWidth;
+  card.classList.add('anchor-flash');
+  card.addEventListener('animationend', function () { card.classList.remove('anchor-flash'); }, { once: true });
+}
+
+(function initProfileFind() {
+  var input = document.getElementById('profiles-filter');
+  profileQuery = new URL(location.href).searchParams.get('q') || '';
+  input.value = profileQuery;
+  input.addEventListener('input', function () { setProfileQuery(input.value); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && input.value) { e.preventDefault(); setProfileQuery(''); }
+  });
+  window.addEventListener('hashchange', function () {
+    anchorPending = true;
+    if (lastProfiles) afterRender();
+  });
+})();
 
 function copyCmd(btn) {
   var cmd = btn.getAttribute('data-cmd');

@@ -6,6 +6,76 @@ Live tests against the real proxy + Claude Max SDK. These verify the full reques
 
 > **Droid tests (D1–D10)** additionally require `droid` installed (`droid --version` ≥ 0.89.0) and a Factory AI account for BYOK configuration. Tests D1–D10 cover internal mode (the default). Passthrough mode for Droid is opt-in via `MERIDIAN_PASSTHROUGH=1` and requires `droid` ≥ 0.109 — see "Droid passthrough mode" below.
 
+## Large session-store mutation and actual OpenCode continuation
+
+```sh
+bun scripts/e2e-session-store-cost.mjs
+E2E_SESSION_STORE_FIXTURE=<printed-artifact>/sessions.json \
+E2E_TOOL_RECEIPT=1 E2E_CONCURRENCY=2 E2E_MODEL=claude-opus-5-5 \
+E2E_PLUGIN_PATH=<installed-opencode-scrub>/dist/index.js \
+bun scripts/e2e-opencode-lifecycle-admission.mjs
+```
+
+The first harness measures 30 writes against a disposable 19.3 MB / 856-entry
+store and asserts retained history; compare the same script on unchanged main.
+It reports timing without enforcing a noisy benchmark threshold.
+`--trace-freeze` measures cold-lookup freeze work when diagnosing overhead.
+The actual headless OpenCode gate runs two isolated clients against that large
+store. Each must execute a real read whose random client-only file receipt
+reaches the SDK through a tool-result request, then complete a same-session
+follow-up. This opt-in fixture enables client tools inside disposable projects;
+normal admission-gate runs retain their existing denied-tool configuration.
+Run all four live E41 modes alongside it for changes to store/resume behavior.
+See [review and before/after evidence](docs/maintenance/evidence/1186-store-mutation.md).
+
+## Auth-status refresh responsiveness
+
+```sh
+bun scripts/e2e-auth-status-refresh.mjs
+```
+
+Requires actual Claude login on macOS/Linux. The gate forwards to the installed
+Claude CLI, delaying only `auth status` by two seconds. Five concurrent warm
+`/health` probes must answer within one second while a single refresh remains
+in flight; `/v1/models` must also answer during that refresh. It asserts healthy
+actual login and that fresh probes do not start another subprocess. Disposable
+configuration/session/work directories and read-only credentials isolate state.
+No authentication payload is fabricated. On an unchanged pre-fix checkout,
+the same harness with `--expect-blocking` must exhibit the two-second stall.
+
+Verified macOS arm64 with Claude Code 2.1.284: baseline five probes 2258 ms
+each; fixed probes 2–4 ms, one real refresh. Adjacent actual headless OpenCode
+1.18.33 / Opus 5.5 / scrub 0.2.3 same-session continuation passed.
+See [durable evidence](docs/maintenance/evidence/1197-auth-refresh.md).
+This demonstrates a controlled auth-subprocess delay, not a reproduction of
+the contributor's entire overloaded Linux deployment or Windows behavior.
+
+## Local build provenance
+
+```sh
+npm run build
+node scripts/e2e-build-provenance.mjs
+```
+
+Run only in an isolated Git checkout, not the checkout of a running service:
+the harness rebuilds `dist` three times. It uses the bundled Node HTTP server
+on an ephemeral loopback port with temporary home state. No model calls or
+service restarts are needed. It verifies the bundled observation worker,
+`current`, three successful counter increments, `3 builds behind`, unchanged
+runtime identity and 30 concurrent cached status requests. Unit tests cover
+dirty/source state, failed certification, rollback, independent worktrees,
+unavailable metadata and safe provenance links. Browser fixture QA covers
+the shared header at 375, 768 and 1280 pixels and npm unchanged behavior.
+
+**Verified 2026-09-26:** Linux, Node bundled server: runtime build #8 remained
+immutable while actual builds #9, #10 and #11 completed. `/build-status` reported
+`behind` with `buildsBehind: 3`; all 30 concurrent requests returned 200.
+Typecheck and build passed. Full `npm test` timed out in session-lifecycle
+tests; an untouched upstream worktree also timed out, and targeted upstream
+retry tests reproduced four idle/busy/extra-usage timing failures. This is not
+a green full-suite claim. Deployment and browser verification on meridian-dev
+remain gated on its owner's source-versus-bundled runtime decision.
+
 ## Antigravity subscription CLI backend
 
 ```sh
@@ -554,6 +624,27 @@ This verifies actual SDK refusal handling and live recovery, not two separate
 paid accounts. Run the full priority-routing suite and all four E41 modes to
 retain the barrier against failover after real content, tools or structured output.
 
+### Late idle deadlines after a proxy freeze (#1222)
+
+Run `scripts/e2e-late-idle-sockets.mjs` with Bun and Node (Node 22 requires
+`--experimental-strip-types`). Its separate writer continues while the guarded
+consumer freezes; active, silent, ping-only and on-time controls are asserted.
+Set `E2E_IDLE_GUARD_MODULE` to an unchanged baseline guard and pass
+`--expect-baseline` to reproduce rejection of queued progress.
+
+After build, run `scripts/e2e-late-idle-client.mjs` with
+`E2E_PROFILE_CLAUDE_DIR` naming an owned native credential directory,
+`E2E_PLUGIN_PATH` naming independently installed scrub, and
+`E2E_OPENCODE_BIN` selecting actual OpenCode. It uses Opus 5.5 by default and
+freezes only the proxy during a sustained actual SDK answer after tool-result
+resume. The native Claude subprocess remains running. The fixed flow must
+observe a production late-deadline resumed verdict, zero stalls, tool receipt,
+continuation, served-model confirmation and consistent credential affinity.
+Use `E2E_PROXY_MODULE` for a built unchanged baseline with `--expect-baseline`;
+it must record an actual late false stall. Run on the implicated Linux runtime
+and include all four E41 modes. Retain sanitized assertions rather than raw
+client transcripts or OAuth values. See the [evidence record](docs/maintenance/evidence/1222-late-idle-deadline.md).
+
 ### Consecutive idle stalls (#868)
 
 ```bash
@@ -618,7 +709,15 @@ SDK session and only the tool set from that recovered turn:
 ```bash
 bun scripts/e2e-capped-turns.mjs --case=client-refusal --stream
 bun scripts/e2e-capped-turns.mjs --case=client-refusal --stream --headerless
+bun scripts/e2e-capped-turns.mjs --case=client-refusal --stream --deferred
 ```
+
+The third command adds a deferred client tool, so the turn budget is 4 rather
+than 1 (the OpenCode shape: its ~100 tools are auto-deferred). The fixture keeps
+answering with the bare name, plus one retry under the registered name that the
+hook drops as the hidden digest, until the real CLI reports `error_max_turns`.
+The client must still receive one clean `tool_use` handoff, not
+`Reached maximum number of turns (4)`.
 
 The second command omits Pi's optional session-affinity header and metadata
 identity, exercising the default fingerprint-scoped, one-shot result handoff
@@ -781,6 +880,44 @@ that the title parses and the client copies a random fixture value through its
 tool loop. It does not mock client or model responses or exercise the terminal
 UI. Both fixtures isolate Meridian state and work only in temporary directories.
 
+### Update check consent
+
+The registry check behind `build.latest` and the header's **update available**
+badge is off until `checkForUpdates` is set. A loopback stand-in registry that
+counts requests proves "off" as zero rather than as silence:
+
+```bash
+BASE=/tmp/meridian-e2e-update; rm -rf $BASE; mkdir -p $BASE
+cat > $BASE/registry.mjs <<'EOF'
+let hits = 0
+Bun.serve({ port: 3472, hostname: "127.0.0.1", fetch(req) {
+  if (new URL(req.url).pathname === "/_hits") return Response.json({ hits })
+  hits++
+  return Response.json({ latest: "1.99.0" })
+} })
+EOF
+bun $BASE/registry.mjs &
+MERIDIAN_PORT=3471 MERIDIAN_CONFIG_DIR=$BASE/config MERIDIAN_SESSION_DIR=$BASE/sessions \
+MERIDIAN_TELEMETRY_DB=$BASE/telemetry.db MERIDIAN_UPDATE_CHECK_PATH=$BASE/update-check.json \
+MERIDIAN_UPDATE_CHECK_URL=http://127.0.0.1:3472/dist-tags MERIDIAN_CREDENTIALS_READONLY=1 \
+  node dist/cli.js > $BASE/proxy.log 2>&1 &
+until curl -sf http://127.0.0.1:3471/health >/dev/null; do sleep 1; done
+S=http://127.0.0.1:3471/settings/api/updates
+curl -s http://127.0.0.1:3472/_hits    # {"hits":0}
+curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":true}' $S
+curl -s http://127.0.0.1:3472/_hits    # {"hits":1}
+curl -s -X PUT -H 'Content-Type: application/json' -d '{"checkForUpdates":false}' $S
+```
+
+**Pass criteria:**
+- No registry request from start until the check is switched on; `$BASE/update-check.json` does not exist.
+- Switching on returns `build.latest: "1.99.0"` and `updateAvailable: true` for a 1.x checkout, and writes `"checkForUpdates": true` to `$BASE/config/settings.json`.
+- Switching off returns no `build.latest`, and `/health` drops it too.
+- In a browser at 375 and 1280 px, the header reads Operational, then the
+  version (`v1.77.1 local` for a checkout), then a blue **update available**
+  link to the releases page. Clearing the Updates toggle on `/settings` hides
+  the link and leaves the version.
+
 ## Test Index
 
 | ID | Section | What It Proves | Verified |
@@ -881,6 +1018,7 @@ UI. Both fixtures isolate Meridian state and work only in temporary directories.
 | E66 | [Interrupted turn after a settled checkpoint](#e66-interrupted-turn-after-a-settled-checkpoint) | **Automated, real proxy + SDK + Claude Max**: `bun scripts/e2e-checkpoint-interrupted-turn.mjs`. An OpenCode-keyed tool round whose complete result is followed by a partial assistant turn (what a dropped stream leaves) must resume the stored session; a result for an unknown call is the negative control and must still take the fresh replay. **Run before releases touching the passthrough early-stop checkpoint or checkpoint replay** | 2026-09-26 |
 | E67 | [OpenCode V2 interrupted tool turn](#e67-opencode-v2-interrupted-tool-turn) | **Actual OpenCode 2.0.16 client and Meridian V2 plugin, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-checkpoint-fault.mjs`. Inject one partial SSE failure after the real client tool call; require the client's exact retry shape and SDK resume, plus a same-session recovery. **Run before releases touching keyed checkpoint recovery** | 2026-09-26 |
 | E68 | [OpenCode V2 user-invoked skill](#e68-opencode-v2-user-invoked-skill) | **Actual OpenCode V2 server, real SDK/model**: `E2E_OPENCODE_BIN=/path/to/opencode E2E_PLUGIN_PATH=/path/to/opencode-scrub/dist/index.js bun scripts/e2e-opencode-skill-content.mjs`. A skill invoked with no typed text must reach the SDK prompt inside `<skill_content>` and drive the reply. **Run before releases touching user-text sanitization** | 2026-09-27 |
+| E73 | [Unknown thinking display values](#e73-unknown-thinking-display-values) | **Automated**: `bun scripts/e2e-thinking-display-interactive.mjs` — actual Claude Code 2.1.287 TUI in a PTY, real proxy/SDK/bundled subprocess. Requires an answer rendered in the client, live-prompt framing, supported-display controls and joined cleanup. The separate HTTP-shaped gate remains a backend smoke test. **Run before releases touching thinking passthrough or the SDK/CLI version** | 2026-10-01 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
 | P2 | [Profile: Switch via API](#p2-profile-switch-via-api) | `POST /profiles/active` switches profile; health endpoint reflects new email | - |
@@ -5756,6 +5894,77 @@ trimmed 12 messages (~3114 estimated tokens) and answered from the kept tail.
 not reproduced live, and neither was the reactive retry, which needs a real
 overflow from the model. Those remain covered only by the mocked envelope tests.
 
+## E73: Unknown thinking display values
+
+**What it proves:** a request whose `thinking.display` the bundled Claude Code
+CLI does not know still runs, instead of killing the SDK subprocess.
+
+Interactive Claude Code in connector-text mode (seen on 2.1.287) sends
+`thinking: { type: "adaptive", display: "updates" }`. Meridian forwarded it to
+the Agent SDK, which passes `display` to its subprocess as
+`--thinking-display updates`; the bundled CLI accepts only
+`summarized|omitted|highlights` and exited 1 before the turn started
+(`sdk_termination reason=process_exit exit=1`), so every such turn failed.
+`buildQueryOptions` now forwards `display` only when the bundled CLI accepts
+it (`summarized`, `omitted`, `highlights`) and drops anything else, logging
+`thinking display "<value>" dropped`; the CLI then uses its default display.
+
+```bash
+bun scripts/e2e-thinking-display.mjs
+```
+
+The HTTP-shaped smoke test above uses the real proxy, Agent SDK and bundled
+subprocess; model `sonnet` (`PROBE_MODEL`). It clears `MERIDIAN_*` settings and
+uses its own config directory so disabled-thinking settings cannot mask the
+subprocess failure. It does not establish actual interactive-client behavior.
+
+The actual-client gate drives Claude Code 2.1.287 in a POSIX PTY, types the
+request after the TUI is ready, and reconstructs its terminal screen with
+Python 3, `pyte==0.8.2` and `wcwidth==0.2.13`. Build first; use an isolated native
+credential directory and the explicitly pinned client executable:
+
+```sh
+npm run build
+E2E_CLAUDE_CLIENT=/absolute/path/to/claude-2.1.287 \
+E2E_PROFILE_CLAUDE_DIR=/absolute/path/to/owned-native-credentials \
+bun scripts/e2e-thinking-display-interactive.mjs
+```
+
+Run that same command against a built unchanged checkout with
+`E2E_MERIDIAN_ROOT=/absolute/path/to/baseline` and
+`E2E_EXPECT_DISPLAY_FAILURE=1`: it requires the native `updates` rejection,
+not any arbitrary failure. On the fixed checkout, repeat with
+`E2E_DISPLAY_MODE=summarized`, `highlights`, and `disabled`. For the actual
+print-mode `omitted` control use `E2E_CLIENT_MODE=print E2E_DISPLAY_MODE=omitted`.
+Interactive 2.1.287 sends `updates` even for the `omitted` flag; do not label
+that run evidence that the SDK retained `omitted`.
+
+The harness isolates client settings, project, proxy config and session storage,
+uses the real SDK without replacing its result, observes the actual client HTTP
+body and native served model, requires the random receipt in both the completed
+HTTP turn and client output, and joins cleanup. It also requires the current
+request to be outside the replay-history envelope: this caught a second bug
+where trailing client `system` metadata made the current request historical.
+Only the replay copy now combines that metadata with the current user turn;
+lineage and budgets retain the original request. Preserved results and causal
+controls are in [the integration evidence](docs/maintenance/evidence/1230-interactive-thinking-display.md).
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- `display: "updates"` returns 200, streams the requested word, and emits no
+  `event: error`.
+- `display: "summarized"` still answers the same way.
+- No `thinking disabled` line: thinking actually reached the SDK.
+- The dropped `"updates"` display is logged exactly once.
+
+**Before/after (2026-10-01, Linux x86_64, Bun 1.3.11, Agent SDK 0.2.141,
+bundled CLI 2.1.284, `sonnet`).** Baseline `3cb65df`: FAIL, 2 checks — the
+`"updates"` request returned 200 with an `event: error` and no text (the
+subprocess had exited on `--thinking-display updates`) and nothing logged a
+drop; `"summarized"` answered. Branch: PASS, 4 of 4: both answered, thinking
+was not forced off, and the drop was logged once. Live, the owner's interactive Claude Code 2.1.287 session failed
+10 of 10 turns through the proxy with this error before the fix.
+
 ## Concurrent transcript publication
 
 Run `bun scripts/e2e-publication-lifetime.mjs` and again with `--stream` after lifecycle or publication changes. This gate uses real Claude Max queries and two concurrent HTTP conversations, each with a fresh and resumed turn. A timing hook pauses each request after its real SDK writer lease is released, promotes its request pin as the owning proxy would, and runs a separate collector process before publication. The collector uses zero grace periods and the supported SDK deleter, exercising the destructive race in an isolated session store and disposable project.
@@ -6925,3 +7134,87 @@ layout checks above; it closes the previously recorded OAuth acceptance gate.
 Final implementation `d244cc45` passed all required CI, including `test`, both
 desktop builds, Windows smoke and Docker smoke. Release publication is authorized
 by the owner and is tracked separately from local installation.
+
+### Mobile account layout and packaged favicon
+
+Use `scripts/e2e-mobile-layout.mjs` with `E2E_BASELINE_ROOT` pointing at unchanged
+main. Open its synthetic fixture URL in the collaborative browser and evaluate
+`scripts/e2e-mobile-layout-browser.js`. The real DOM matrix asserts baseline
+overflow, final page bounds, keyboard details, sort focus and rename at seven
+widths. No credentials or model calls are needed for static page layout.
+After building, `node scripts/e2e-packaged-favicon.mjs` verifies real HTTP asset
+resolution and all six page links through the bundled Node entrypoint.
+
+### Opt-in error reporting process policy
+
+After building, run `bun scripts/e2e-error-reporting-policy.mjs`. This headless
+gate compares real Node/Bun processes with reporting off/on, preserves all five
+Node rejection policies (CLI and NODE_OPTIONS), checks actual Meridian recovery
+handlers, exact-once scrubbed envelopes, and compiled `test-error-report`
+wiring. It uses an isolated local collector and synthetic errors, not a model
+or third-party ingestion account. See the retained evidence for its limits.
+
+For profile navigation and search, serve actual templates with
+`E2E_BASELINE_ROOT=<unchanged-main> bun scripts/e2e-profile-find.mjs`, open the
+reported URL in the collaborative browser, and evaluate the full expression in
+`scripts/e2e-profile-find-browser.js`. Require PASS for the mobile/desktop matrix,
+anchor/header growth, polling/focus, filter/reorder and no-routing-mutation
+controls. See `docs/maintenance/evidence/1200-profile-find.md` for evidence limits.
+
+## SDK ping idle regression (#1177)
+
+See [durable evidence](docs/maintenance/evidence/1177-sdk-ping-idle.md).
+`node scripts/repro-sdk-ping-idle.mjs` directly asserts the deadline.
+`E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> node scripts/e2e-pi-sdk-ping-idle.mjs`
+drives actual Pi/SDK/CLI against a controlled ping-only API;
+`E2E_EXPECT_STALL=0` asserts the unchanged baseline waits past its deadline.
+Use the live companion with the same client/CLI and installed Pi scrub entry:
+`E2E_MERIDIAN_ROOT=<built checkout> E2E_PI_CLI=<cli.js> E2E_CLAUDE_BIN=<2.1.283> E2E_PLUGIN_PATH=<entrypoint> node scripts/e2e-pi-live-idle-control.mjs`.
+The controlled upstream is not a live model; the companion uses actual Opus 5.5
+and proves a real read receipt and Pi session continuation.
+
+For synthetic build-header state inspection, run
+`bun scripts/e2e-build-header-fixture.ts` and open loopback port 42213 with
+`?state=current`, `behind`, `rollback`, `source-changed`, `invalid`, `unknown`,
+`failure` or `npm`. Inspect identity, drift, health, safe links and focus after
+a repeated poll. `/fixture-observations` counts drift requests; the npm state
+must stay at zero. This fixture uses the actual shared header but supplies
+synthetic API states; it does not prove real artifact certification, which
+requires `node scripts/e2e-build-provenance.mjs` separately. It uses no model or
+credentials. [Incorporation evidence](docs/maintenance/evidence/1171-build-provenance.md)
+records the platform and measured preview viewport.
+
+## Client HTTP activity (#1190)
+
+After build, run `E2E_AUTH_FILE=<private access-only JSON snapshot>
+E2E_PLUGIN_PATH=<independently installed scrub entrypoint> bun
+scripts/e2e-inflight-client.mjs`. The actual OpenCode/SDK/model gate launches two
+independent clients, observes active/queued/idle counts over real sockets, checks
+forwarding refusal, and resumes one client's conversation. The snapshot contains
+`accessToken` and `expiresAt`, never a refresh token, and must stay mode 0600.
+The proxy uses a read-only isolated OAuth-token profile. The endpoint describes
+`scope: client-http`; zero cannot establish background-job, pending-continuation
+or post-probe restart safety. See the durable [evidence](docs/maintenance/evidence/1190-request-activity.md).
+
+### Profile-copy pruning (#1187)
+
+Run the maintained `scripts/e2e-profile-copy-prune-client.mjs` against an owned
+access-only grant and independently installed OpenCode scrub as documented in
+[the evidence record](docs/maintenance/evidence/1187-profile-copy-pruning.md).
+Run once with `E2E_PRUNE_ENABLED=1` and once with `0`: verify actual SDK deletion
+versus retained native resume, immutable fork source, unchanged newest history,
+unrelated aged session retention and a client-tool receipt surviving the final
+return. Both aliases deliberately share a grant, so this is lifecycle proof.
+Run all four E41 modes for affected session/history/cache continuity as well.
+Production pruning is opt-in through `MERIDIAN_SESSION_PROFILE_COPY_PRUNE=1`.
+
+### Asynchronous SDK launch gate (#1221)
+
+After build, run `scripts/e2e-sdk-gate-client.mjs` with
+`E2E_PROFILE_CLAUDE_DIR`, `E2E_PLUGIN_PATH` and optional `E2E_CLAUDE_BIN` as
+documented in [the evidence record](docs/maintenance/evidence/1221-async-sdk-gate.md).
+Actual gate file-handle fsyncs are held while the real OpenCode/SDK/model path
+runs. Require liveness answers during those holds, a random tool receipt and
+same-session recall, actual served-model confirmation and zero client exits.
+The direct gate regression additionally requires bounded join and eventual
+sensitive-file cleanup if disk publication remains stuck after child exit.

@@ -102,7 +102,9 @@ export const settingsPageHtml = `<!DOCTYPE html>
   }
   .reset-btn:hover { border-color: var(--red); color: var(--red); }
 
-  /* Model pricing */
+  /* Model pricing. Four fixed-width rate inputs cannot shrink to a phone
+     viewport, so the table scrolls inside its card instead of the page. */
+  .pricing-scroll { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
   .pricing-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .pricing-table th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500;
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
@@ -167,10 +169,12 @@ ${profileBarHtml}
     dashboard until defined here). Changes apply on the next dashboard refresh.
   </p>
   <div class="adapter-card">
-    <table class="pricing-table">
-      <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th><th>Source</th><th></th></tr></thead>
-      <tbody id="pricingRows"></tbody>
-    </table>
+    <div class="pricing-scroll">
+      <table class="pricing-table">
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Write</th><th>Source</th><th></th></tr></thead>
+        <tbody id="pricingRows"></tbody>
+      </table>
+    </div>
     <div class="pricing-add">
       <input type="text" class="pricing-input" id="newModelName" placeholder="model id (e.g. claude-opus-9)">
       <input type="number" class="pricing-input" id="newModelInput" placeholder="input" min="0" step="0.01">
@@ -197,6 +201,17 @@ ${profileBarHtml}
   </p>
   <div class="adapter-card" id="telemetry-card">
     <div id="telemetry-body">Loading…</div>
+  </div>
+
+  <h1 style="margin-top:40px">Updates</h1>
+  <p class="subtitle" style="max-width:720px;line-height:1.6">
+    Meridian is installed and updated by hand, so an instance can sit on an old version for weeks without
+    anyone noticing. Switch this on and it asks the npm registry once a day whether a newer version is
+    published; the site header then says so, beside the version it is running. Off unless you turn it on —
+    nothing contacts the registry until then. The header shows the running version either way.
+  </p>
+  <div class="adapter-card" id="updates-card">
+    <div id="updates-body">Loading…</div>
   </div>
 </div>
 
@@ -661,10 +676,49 @@ async function putTelemetry(body) {
   await loadTelemetry();
 }
 
+async function loadUpdates() {
+  const cfg = await (await fetch('/settings/api/updates')).json();
+  const build = cfg.build || {};
+
+  let state;
+  if (cfg.envOptOut) state = 'forced off';
+  else if (!cfg.checkForUpdates) state = 'not checking';
+  else if (!build.latest) state = 'checking…';
+  else state = build.updateAvailable ? telemetryEsc(build.latest) + ' available' : 'up to date';
+
+  document.getElementById('updates-body').innerHTML = telemetryRow('Check for updates',
+    '<input type="checkbox" id="upd-enabled"' + (cfg.checkForUpdates ? ' checked' : '') + (cfg.envOptOut ? ' disabled' : '') + '>',
+    state,
+    cfg.envOptOut ? ' <span style="font-size:11px;color:var(--yellow)">(MERIDIAN_NO_UPDATE_CHECK=1 wins over this setting)</span>' : '')
+    + '<div class="pricing-note" style="margin-top:4px">Running ' + telemetryEsc(build.version || 'unknown')
+      + (build.source && build.source !== 'npm' ? ' from a ' + telemetryEsc(build.source) + ' build; the header shows its separate release and runtime provenance' : '')
+      + '.</div>';
+
+  const box = document.getElementById('upd-enabled');
+  if (box && !cfg.envOptOut) box.addEventListener('change', (e) => putUpdates(e.target.checked));
+}
+
+async function putUpdates(checkForUpdates) {
+  const res = await fetch('/settings/api/updates', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ checkForUpdates }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || 'Failed to save update settings');
+  } else {
+    showSaved();
+    if (window.meridianHeaderRefresh) window.meridianHeaderRefresh();
+  }
+  await loadUpdates();
+}
+
 loadConfig();
 loadPricing();
 loadRouting();
 loadTelemetry();
+loadUpdates();
 ${profileBarJs}
 </script>
 </body>

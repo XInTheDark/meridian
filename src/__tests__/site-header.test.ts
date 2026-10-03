@@ -15,6 +15,7 @@ import { settingsPageHtml } from "../telemetry/settingsPage"
 import { profilePageHtml } from "../telemetry/profilePage"
 import { pluginPageHtml } from "../proxy/plugins/pluginPage"
 import { profileBarCss, profileBarHtml, profileBarJs } from "../telemetry/profileBar"
+import { ICON_PATH } from "../telemetry/icon"
 import { DEFAULT_PROFILE_SORT, PROFILE_SORT_MODES } from "../telemetry/profileSort"
 import { FADE_FROM, GENERAL_WINDOW_TYPES, SPENT_AT } from "../telemetry/profileSpent"
 
@@ -63,27 +64,56 @@ describe("shared site header", () => {
     // Violet = meta: the provenance chip has no href and must not be blue.
     // Swapping these is the single easiest way to break the design language,
     // and it is invisible in a screenshot review.
-    expect(profileBarCss).toContain(".mh-build.update")
-    expect(profileBarCss).toContain(".mh-build.provenance")
+    // The provenance pill is violet, but its branch/commit pieces are links
+    // and must be blue; drift uses the semantic warning hue and nothing else.
+    const rule = (selector: string) => {
+      const start = profileBarCss.indexOf(`.meridian-header ${selector} {`)
+      expect(start, `${selector} rule exists`).toBeGreaterThanOrEqual(0)
+      return profileBarCss.slice(start, profileBarCss.indexOf("}", start))
+    }
 
-    const updateRule = profileBarCss.slice(
-      profileBarCss.indexOf(".meridian-header .mh-build.update"),
-      profileBarCss.indexOf(".meridian-header .mh-build.provenance"),
-    )
+    const updateRule = rule(".mh-update")
     expect(updateRule).toContain("var(--accent, #58a6ff)")
     expect(updateRule).not.toContain("--accent2")
 
-    const provenanceRule = profileBarCss.slice(profileBarCss.indexOf(".meridian-header .mh-build.provenance"))
+    const provenanceRule = rule(".mh-prov")
     expect(provenanceRule).toContain("var(--accent2, #bc8cff)")
-    // Non-interactive: no href is set for this state, so no pointer affordance.
-    expect(provenanceRule).toContain("cursor: default")
-    expect(profileBarJs).toContain("removeAttribute('href')")
+    expect(provenanceRule).not.toContain("var(--accent,")
+
+    const linkRule = rule("a.mh-prov-part")
+    expect(linkRule).toContain("var(--accent, #58a6ff)")
+    expect(linkRule).not.toContain("--accent2")
+
+    const driftWarning = rule(".mh-drift.warning")
+    expect(driftWarning).toContain("var(--yellow, #d29922)")
+    expect(rule(".mh-drift")).not.toContain("--yellow")
+
+    // Pieces without a safe URL render as spans, never as href-less anchors.
+    expect(profileBarJs).toContain("document.createElement(part.href ? 'a' : 'span')")
+    expect(profileBarHtml).toContain('id="mhUpdate"')
+  })
+
+  test("drift is polled only for local builds, never overlapping, and bypasses the cache", () => {
+    expect(profileBarHtml).toContain('id="mhProv"')
+    expect(profileBarHtml).toContain('id="mhDrift"')
+    expect(profileBarJs).toContain("fetch('/build-status', { cache: 'no-store'")
+    expect(profileBarJs).toContain("setDriftTracking(view.mode === 'local')")
+    expect(profileBarJs).toContain("if (!driftTracking || driftInFlight) return;")
   })
 
   test("every page embeds the shared header exactly once", () => {
     for (const [name, html] of allPages) {
       const count = html.split("meridian-header").length - 1
       expect(count, `${name} page should embed the header once`).toBeGreaterThanOrEqual(1)
+    }
+  })
+
+  // Without it the browser falls back to /favicon.ico, which nothing serves,
+  // and every page load logs a 404 in the console.
+  test("every page links the Meridian favicon", () => {
+    for (const [name, html] of allPages) {
+      const head = html.slice(0, html.indexOf("</head>"))
+      expect(head, `${name} page should link the favicon`).toContain(`<link rel="icon" type="image/svg+xml" href="${ICON_PATH}">`)
     }
   })
 })
@@ -145,6 +175,24 @@ describe("landing page layout", () => {
     expect(landingHtml).not.toContain(".profile-card.spend-fading:hover, .profile-card.spend-spent:hover {")
   })
 
+  test("a card's badges wrap instead of pushing the cost past a phone's edge", () => {
+    // Measured at 375px: a "needs login" pill beside a long name pushed the
+    // cost 80px outside its card and scrolled the whole page sideways.
+    const rule = (selector: string) => {
+      const start = landingHtml.indexOf(`  ${selector} {`)
+      expect(start, `${selector} rule`).toBeGreaterThanOrEqual(0)
+      return landingHtml.slice(start, landingHtml.indexOf("}", start))
+    }
+    expect(rule(".profile-grid")).toContain("minmax(min(300px, 100%), 1fr)")
+    expect(rule(".profile-head")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("min-width: 0")
+    expect(rule(".profile-name")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-cost")).toContain("flex-shrink: 0")
+    const header = profileBarCss.slice(profileBarCss.indexOf(".meridian-header {"))
+    expect(header.slice(0, header.indexOf("}"))).toContain("flex-wrap: wrap")
+  })
+
   test("accounts can be re-sorted for viewing without touching the saved order", () => {
     // The page carries a copy of the comparator, so the modes it offers are
     // interpolated from the tested module rather than retyped.
@@ -160,6 +208,39 @@ describe("landing page layout", () => {
     // the single-account fallback labels the card with the login email.
     expect(landingHtml).toContain("configured.length>0")
     expect(landingHtml).toContain("k==='default'?(email||'account')")
+  })
+})
+
+describe("profiles page layout", () => {
+  const rule = (selector: string) => {
+    const start = profilePageHtml.indexOf(`  ${selector} {`)
+    expect(start, `${selector} rule`).toBeGreaterThanOrEqual(0)
+    return profilePageHtml.slice(start, profilePageHtml.indexOf("}", start))
+  }
+
+  test("a card's header wraps instead of pushing its actions past a phone's edge", () => {
+    // Measured at 320px and 375px: the name, type badge and rename button
+    // sat on one unwrapping row and scrolled the page to 536px.
+    expect(rule(".profile-card-header")).toContain("flex-wrap: wrap")
+    expect(rule(".profile-name")).toContain("min-width: 0")
+    expect(rule(".profile-name")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-badge")).toContain("overflow-wrap: anywhere")
+    expect(rule(".profile-card-actions")).toContain("margin-left: auto")
+    expect(rule(".profile-card-actions")).toContain("flex-shrink: 0")
+    expect(rule(".rename-input")).toContain("max-width: 100%")
+  })
+
+  test("long values wrap inside the card rather than widening it", () => {
+    // A bare 1fr track is as wide as its longest unbreakable value, so an
+    // email address pushed the detail grid past the card.
+    expect(rule(".profile-details")).toContain("grid-template-columns: 120px minmax(0, 1fr)")
+    expect(rule(".detail-value")).toContain("overflow-wrap: anywhere")
+    expect(rule(".copy-cmd")).toContain("overflow-wrap: anywhere")
+    expect(rule(".switch-btn")).toContain("overflow-wrap: anywhere")
+    expect(rule(".usage-grid")).toContain("minmax(min(140px, 100%), 1fr)")
+    expect(rule(".usage-label")).not.toContain("white-space: nowrap")
+    const narrow = profilePageHtml.slice(profilePageHtml.indexOf("@media (max-width: 480px)"))
+    expect(narrow.slice(0, narrow.indexOf("}"))).toContain("grid-template-columns: minmax(0, 1fr)")
   })
 })
 
@@ -186,6 +267,13 @@ describe("design-system conformance (DESIGN.md)", () => {
       const bodyRule = src.match(/body \{[^}]*\}/)?.[0] ?? ""
       expect(bodyRule.includes("background"), `${path} body rule must not set background`).toBe(false)
     }
+  })
+})
+
+describe("settings page layout", () => {
+  test("pricing table scrolls inside its card so a phone viewport never scrolls sideways", () => {
+    expect(settingsPageHtml).toMatch(/\.pricing-scroll \{[^}]*overflow-x: auto/)
+    expect(settingsPageHtml).toMatch(/<div class="pricing-scroll">\s*<table class="pricing-table">/)
   })
 })
 

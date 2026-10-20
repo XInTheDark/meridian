@@ -523,6 +523,31 @@ describe("createResponsesSseTranslator (stream)", () => {
     expect(fc.call_id).toBe("toolu_9")
   })
 
+  for (const fixture of [
+    { name: "a zero-argument tool with no JSON deltas", input: {}, partials: [], args: "{}" },
+    { name: "complete initial input with no JSON deltas", input: { path: "receipt.pdf" }, partials: [], args: '{"path":"receipt.pdf"}' },
+    { name: "JSON deltas instead of the initial placeholder", input: {}, partials: ['{"path":', '"receipt.pdf"}'], args: '{"path":"receipt.pdf"}' },
+    { name: "invalid nonempty JSON without replacing it with an empty object", input: {}, partials: ["{"], args: "{" },
+  ]) {
+    it(`finishes ${fixture.name}`, () => {
+      const out = run([
+        { type: "message_start", message: { id: "m1" } },
+        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_pdf", name: "view_pdf", input: fixture.input } },
+        ...fixture.partials.map(partial_json => ({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json } })),
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "tool_use" } },
+        { type: "message_stop" },
+      ])
+      expect(out.find(event => event.event === "response.function_call_arguments.done")?.data.arguments).toBe(fixture.args)
+      expect(out.find(event => event.event === "response.output_item.done")?.data.item).toEqual(expect.objectContaining({
+        type: "function_call", call_id: "toolu_pdf", arguments: fixture.args,
+      }))
+      expect(out.find(event => event.event === "response.completed")?.data.response).toEqual(expect.objectContaining({
+        output: [expect.objectContaining({ type: "function_call", call_id: "toolu_pdf", arguments: fixture.args })],
+      }))
+    })
+  }
+
   it("skips thinking blocks without emitting items", () => {
     const out = run([
       { type: "message_start", message: { id: "m1", usage: { input_tokens: 1 } } },

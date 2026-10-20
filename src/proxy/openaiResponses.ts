@@ -789,6 +789,7 @@ export function createResponsesSseTranslator(ctx: ResponsesCtx) {
     itemId: string
     text: string          // accumulated text (text blocks)
     args: string          // accumulated JSON (tool blocks)
+    initialInput?: unknown // complete input when the tool emits no JSON deltas
     callId?: string
     name?: string
     custom?: boolean      // freeform tool: no argument deltas, one done item
@@ -865,7 +866,7 @@ export function createResponsesSseTranslator(ctx: ResponsesCtx) {
           const callId = String(cb.id ?? "")
           const name = String(cb.name ?? "")
           const custom = ctx.toolAliases?.get(name)?.kind === "custom"
-          blocks.set(idx, { kind: "tool", outputIndex: oi, itemId, text: "", args: "", callId, name, custom })
+          blocks.set(idx, { kind: "tool", outputIndex: oi, itemId, text: "", args: "", initialInput: cb.input, callId, name, custom })
           out.push(emit("response.output_item.added", {
             output_index: oi,
             item: toolCallItem(ctx, itemId, callId, name, "", "in_progress"),
@@ -919,12 +920,17 @@ export function createResponsesSseTranslator(ctx: ResponsesCtx) {
           finalOutput.push(item)
           out.push(emit("response.output_item.done", { output_index: st.outputIndex, item }))
         } else if (st.kind === "tool") {
+          // Zero-argument tools may close without any JSON delta. Their
+          // initial input is still a complete object, and Responses clients
+          // parse the terminal arguments as JSON. Preserve nonempty deltas,
+          // including malformed ones, rather than masking them with `{}`.
+          const args = st.args || JSON.stringify(st.initialInput ?? {})
           if (!st.custom) {
             out.push(emit("response.function_call_arguments.done", {
-              item_id: st.itemId, output_index: st.outputIndex, arguments: st.args,
+              item_id: st.itemId, output_index: st.outputIndex, arguments: args,
             }))
           }
-          const item = toolCallItem(ctx, st.itemId, st.callId ?? "", st.name ?? "", st.args, "completed")
+          const item = toolCallItem(ctx, st.itemId, st.callId ?? "", st.name ?? "", args, "completed")
           finalOutput.push(item)
           out.push(emit("response.output_item.done", { output_index: st.outputIndex, item }))
         }

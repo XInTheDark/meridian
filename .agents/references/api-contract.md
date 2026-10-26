@@ -1,3 +1,11 @@
+---
+id: api-contract
+type: architecture-design
+title: Stable public API and plugin contract
+status: active
+parent: architecture
+---
+
 # Plugin API boundaries
 
 ## Stable API Contract
@@ -8,8 +16,11 @@ External plugins depend on these interfaces. **Changes require project owner app
 |-----------|----------|---------|
 | `startProxyServer(config)` → `ProxyInstance` | `server.ts` | Plugins that spawn proxy instances |
 | `ProxyInstance.close()` | `types.ts` | Plugins for graceful shutdown |
+| `initializeProxyBookkeeping()` → opaque `ProxyBookkeepingHandle` with `close(): Promise<void>` | `session/bookkeeping/embedding.ts`, exported by `server.ts` | Owner-approved #1277 opt-in SQL embedding; JSON returns undefined, native SQL/path/readers stay private, successful close joins admitted durable work |
+| `clearSessionCache(): Promise<void>` | `session/cache.ts`, exported by `server.ts` | Owner-approved #1244/#1277 cleanup: reset memory immediately; await ordered durable cleanup, retaining its best-effort error policy |
 | `ProxyConfig` type | `types.ts` | Plugin configuration |
 | `x-opencode-session` header | `adapters/opencode.ts` | Session tracking from agent plugins |
+| Generic OpenAI `x-session-id` on `/v1/chat/completions` | `adapters/openai.ts`, `server.ts` | Owner-approved #1441: distinct conversation identity after the existing OpenCode/session-affinity keys and agent scoping; blank values keep the headerless path |
 | `x-meridian-profile` header | `server.ts`, `profiles.ts` | Per-request profile selection |
 | `x-meridian-cache-keepalive` header | `server.ts`, `cacheKeepalive.ts` | Opt-in prompt-cache keepalive window, in seconds |
 | `GET /health` response shape | `server.ts` | Plugin health checks |
@@ -17,10 +28,73 @@ External plugins depend on these interfaces. **Changes require project owner app
 | Antigravity `/v1/responses` and `/v1/responses/:id` | `backends/antigravityOpenai.ts`, `backends/antigravityResponses.ts` | OpenAI clients; bounded continuation/retrieval/deletion, optional durable state, background cancellation/event replay/input listing and input-token estimates (#1073) |
 | `/providers/status` and `/antigravity/*` | `server.ts` / `backends/` | Shared provider UI and Antigravity clients (#1073) |
 | `/health` `build` block | `buildInfo.ts` | Version/provenance drift detection |
+| `/health` optional `build.latest` / `build.updateAvailable`, authenticated `GET` / `PUT /settings/api/updates` | `server.ts`, `updateCheck.ts`, `pluginUpdateCheck.ts` | Explicit opt-in registry checks and shared settings UI (#1226). Owner-approved 2026-10-26 (#1445): the response adds `plugins[]`, one entry per loaded plugin with `name`, `path`, `status`, `checkable`, `reason`, `package`, `installed`, `latest`, `updateAvailable`, `checkedAt`, `error` (optional fields absent when unknown); the list is present while the check is off, and the same `checkForUpdates` toggle governs sending plugin package names to the registry |
+| `/health` optional `hostname`, authenticated `GET` / `PUT /settings/api/header` | `headerSettings.ts`, `server.ts`, `backends/antigravity.ts` | Default-off `showHostname` setting naming the machine in the shared header; owner-approved in #1259 |
+| Authenticated `GET` / `PUT /settings/api/layout` | `server.ts`, `telemetry/pageLayout.ts` | Contained/wide page layout setting and shared settings UI |
+| Authenticated `GET` / `PUT /settings/api/claude-executable`; `/health` `claudeExecutable.source` value `custom` | `claudeExecutableSettings.ts`, `claudeExecutablePreference.ts`, `models.ts` | System/bundled/custom Claude Code executable choice, applied to the next turn; same-origin browser writes; `MERIDIAN_CLAUDE_PATH` still wins |
+| `GET /build-status` | `buildRuntime.ts` | Local/dev runtime versus disk provenance (#1170); optional API-key protection, npm returns 404 |
 | `POST /v1/messages` request/response format | `server.ts` | All agents (Anthropic API contract) |
 | `GET /profiles/list` response shape | `server.ts` | Profile management UI and CLI |
+| `GET /profiles/list` entries' `duplicateOf`, `duplicateBasis` and `factsRefresh` (`{state,since,at,error}` or `null`); a Claude entry's `email` from the account read | `server.ts`, `duplicateProfiles.ts`, `profileFactsRefresh.ts`, `organizationName.ts` | Owner-approved 2026-10-26 (#1446): additive, informational duplicate-account and post-sign-in status on every entry |
+| `GET /inflight` response shape and loopback-only access | `server.ts`, `inflight.ts` | Loopback supervisors observing `scope: client-http`; not a restart/admission barrier (#1216) |
+| `POST`/`DELETE /drain` request/response and local operator access | `server.ts`, `admissionHold.ts` | Owner-approved #1282: bounded per-instance generation delay; actual loopback/no forwarding/no Origin, configured API key required; aggregate `draining`/`drain` in `GET /inflight`, no restart guarantee |
+| `GET /readyz` status and `upstream-claude` check, `/health` `upstream.claude` block, loopback-only `PUT /upstream-reachability` | `server.ts`, `probes.ts`, `upstreamReachability.ts` | Instance-local native-Claude transport failure observations, default readiness policy and bounded operator override; owner-approved in #1281 |
 | `POST /profiles/active` request/response | `server.ts` | Profile switching from CLI and UI |
+| ChatGPT additions: OpenAI model ids on `/v1/responses` routed to ChatGPT seats; new `POST /v1/images/generations` and `/v1/images/edits` (ChatGPT only, 404 without it); `/health` `chatgpt` and `backends`; `/profiles/list` entries with `type: "chatgpt"`, `activeProfiles`, `chatgpt.owner`; `provider` on `POST /profiles/active`; `chatgpt` in `GET /inflight`; `/profiles/chatgpt/*`, `/settings/api/chatgpt` | `server.ts`, `upstream/`, `backends/chatgpt.ts`, `chatgpt/` | Additive and absent unless `MERIDIAN_CHATGPT_CREDENTIALS` (or a populated owned store) enables ChatGPT; existing fields keep their meaning: `activeProfile` stays the Claude pointer wherever Claude profiles exist |
 If you need to modify any of these, open an issue first — breaking changes affect downstream plugin authors.
+
+The owner approved #1446's `/profiles/list` additions on 2026-10-26. Every
+entry gains `duplicateOf` (ids of other profiles signed in to the same account,
+`[]` when none), `duplicateBasis` (`account-organization`, `email-organization`,
+`seat`, `workspace-email` or `null`) and `factsRefresh` (`null` when idle,
+`{ state: "updating", since }` after a finished sign-in, or
+`{ state: "failed", since, at, error }` for five minutes after its re-read
+failed). A Claude entry's existing `email` now prefers the email
+`GET /api/oauth/profile` reported for the credential the profile stores now
+over `claude auth status`, which can still name the account signed in before.
+The fields are informational: they do not change routing, cooldowns or any
+other entry field.
+
+The owner approved the generic OpenAI conversation-header contract in #1441
+on 2026-10-21. `x-opencode-session` and `x-session-affinity` retain precedence
+over `x-session-id`, including their existing agent scoping. A nonblank
+`x-session-id` must be distinct per conversation and follows the same serialized,
+append-only history, fork and retry behavior as the other explicit keys.
+Other adapters retain their identity rules; request-body and CORS policy are
+unchanged. Actual affected-flow evidence and final-head checks remain required.
+
+The owner approved executable selection in #1319 on 2026-10-08. System remains
+the default; `MERIDIAN_CLAUDE_PATH` has highest priority. The authenticated
+GET/PUT uses no-store responses and the existing same-origin browser-write
+policy. Custom paths must be absolute and pass a bounded shell-free version
+check. Changes apply to subsequent turns; a started turn retains its selected
+path through retries. Concurrent selection changes during vetting return 409;
+cancelled/unconfirmed path-vetting probes return 503 before saving the choice. The health
+contract adds only `custom` to the existing executable-source enum.
+
+As with an HTTP write whose response is interrupted, a completed preference
+write is not rolled back if a subsequent state-description probe or disconnect
+fails. Read GET to confirm the saved preference after an ambiguous response.
+
+The hostname contract was approved by the owner on 2026-10-04 in #1259's
+review conversation. Claude and standalone Antigravity share the persisted
+setting and header API behind their existing optional API-key gate. Only an
+explicit boolean `true` adds the OS hostname to unauthenticated `/health`;
+`false` hides it, `null` removes the stored field, and an omitted field is a
+no-op. `/livez` and `/readyz` retain their existing contracts. Header settings
+and health use `Cache-Control: no-store`, and consent is re-read after health
+probes. Browser writes require the same origin, with a bounded HTTPS-origin
+bridge for an HTTP TLS-termination hop that preserves public Host/port
+(including explicit default 443). Foreign/opaque/malformed origins and
+different ports are rejected; forwarding headers confer no trust.
+
+The Pi extension (#1408, owner-approved) adds three client contracts: the
+`pi1` generation on the existing `x-meridian-opencode-turn` header, signed with
+the same `opencode-turn.key`/`MERIDIAN_OPENCODE_ATTESTATION_KEY` and accepted
+only by the Pi adapter (OpenCode rejects it, and Pi rejects OpenCode
+generations); `plugin.pi` (`"configured"`/`"not-configured"`) beside
+`plugin.opencode` in `/health`; and `MERIDIAN_SOURCE` in a child Pi process's
+environment, which the extension sends as `x-meridian-source`.
 
 Antigravity additionally accepts `statePath`, `plugins` and `pluginPaths` under its
 backend options. These are provider-specific and do not change Claude plugin
@@ -60,3 +134,16 @@ unresolved guard. This is not active-process restoration or client-tool executio
 journaling. Failed official read-only probes impose a five-second readiness
 cooldown with HTTP 503 and Retry-After. Both changes are within #1073's recovery
 and failure-handling scope.
+
+The owner approved #1281's corrected full reachability contract on 2026-10-05.
+Claude/combined health adds aggregate `upstream.claude` observations without raw
+errors or account identities. The state is local and ephemeral; configured-egress
+transport answers do not prove Anthropic origin, account validity or inference.
+Default readiness requires three definite connection failures spanning 120 seconds
+and holds until 300 seconds after the latest failure; the subsequent probing state
+is passive. Null retry statuses and generic read timeouts do not establish failure.
+The loopback override has optional configured-key protection, the exact existing
+hostname Origin policy and a bounded TTL; no public ProxyConfig or global CORS
+expansion is approved. Standalone/mounted Antigravity probes remain unchanged.
+Correctness, actual affected-flow evidence and final-head CI remain acceptance
+gates distinct from this approval. No release is authorized.

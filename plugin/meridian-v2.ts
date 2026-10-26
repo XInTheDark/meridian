@@ -135,9 +135,10 @@ export function applyMeridianV2Headers(
     setHeader(headers, "x-session-affinity", input.sessionID)
     setHeader(headers, "x-session-id", input.sessionID)
     if (input.agent === ATTACHED_COMPACTION_AGENT || input.kind === "compaction") {
-      // Source selects the base model tier without making the adapter append
-      // `#compaction` to the primary session key.
-      setHeader(headers, "x-meridian-source", "subagent-compaction")
+      // A `fork-` source keeps the conversation's model tier (the compaction
+      // carries the history it summarizes) and, unlike an agent-mode change,
+      // does not make the adapter append `#compaction` to the primary key.
+      setHeader(headers, "x-meridian-source", "fork-compaction")
     }
   }
 
@@ -518,10 +519,10 @@ export function resolveCatalogModels(
  * Write Meridian's advertised models over the assembled V2 catalog.
  *
  * Meridian is authoritative for what it will actually serve: the context window
- * follows the signed-in subscription (Sonnet stays 200k so a 1M turn is not
- * billed as Extra Usage), and the effort levels are the ones the proxy accepts.
- * OpenCode's built-in models.dev entries disagree — beta-18866 advertises a 1M
- * Sonnet — so an entry that already exists must be corrected, not skipped.
+ * follows the signed-in subscription (Sonnet 4.x stays 200k so a 1M turn is not
+ * billed as Extra Usage; Sonnet 5+ is natively 1M), and the effort levels are
+ * the ones the proxy accepts. OpenCode's built-in models.dev entries can
+ * disagree, so an entry that already exists must be corrected, not skipped.
  *
  * This does not overwrite user configuration. V2 layers `providers.<id>.models`
  * on top of plugin transforms, verified live on beta-18866: a configured

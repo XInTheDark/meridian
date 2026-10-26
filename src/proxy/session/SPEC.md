@@ -41,6 +41,12 @@ Code: `src/proxy/session/`, plus `sessionStore.ts`, `sessionLifecycle.ts` and
   `recoveryClaim`).
 - JSON bookkeeping is the default; `MERIDIAN_BOOKKEEPING=sqlite` is explicit and
   a SQLite directory never falls back to JSON.
+- A prompt-cache keepalive beat (see `proxy-core` → Decisions) only **reads**
+  a published mapping: it resumes the mapping's current transcript as a
+  non-persisted fork, takes no writer or publication lease, and never
+  publishes, invalidates or reclassifies anything. The session's mapping,
+  transcript and lineage are byte-identical before and after a beat; the
+  source transcript is pinned against GC until the beat's child is joined.
 
 Detailed contracts live in [`architecture`](../../../ARCHITECTURE.md): *Session
 Management*, *Lineage Verification*, *SQLite bookkeeping boundary*, *Transcript

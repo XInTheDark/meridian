@@ -1,75 +1,146 @@
 /**
  * Prompt-cache keepalive: keeps an idle session's cached prefix warm.
  *
- * Anthropic's prompt cache lives for five minutes, and the clock starts when a
- * request that reads or writes the prefix is RECEIVED, not when its response
- * ends. A user who reads a reply for six minutes, or a client tool that runs
- * that long, therefore pays to write the whole conversation again on the next
- * turn. A client can opt a session in with `x-meridian-cache-keepalive:
- * <seconds>`; until that window has passed since the session's latest request
- * started, Meridian sends a tiny request shortly before the cache would expire.
+ * Off unless the operator turns it on. Only sessions whose latest real turn
+ * wrote the one-hour cache tier are tracked; while one stays idle, Meridian
+ * sends one small cache-read beat shortly before that hour runs out, at most
+ * a few times, then lets the cache expire. Rationale and measurements live in
+ * src/proxy/SPEC.md (Decisions → prompt-cache keepalive).
  *
- * Which prefix a keepalive refreshes follows the published mapping, not the
- * request in flight. A turn that is still generating has not produced the
- * prefix the next turn will reuse, so until it publishes, keepalives keep the
- * previous mapping warm. Its start time still counts for both: it read the old
- * prefix and wrote the new one when it began.
- *
- * A newly published session is left alone briefly. A turn that ran for most of
- * the TTL publishes inside the lead, and a client in a tool loop sends its next
- * turn seconds later; a keepalive in between only duplicates that turn's cache
- * write. The client's request moves the anchor first, so no keepalive is due.
+ * Which prefix a beat refreshes follows the published mapping, not the
+ * request in flight. A newly published session is left alone briefly so a
+ * client's next turn, not a beat, refreshes it.
  *
  * Pure scheduling: no SDK, HTTP or I/O. The caller resolves the current
- * mapping and runs each keepalive.
+ * mapping and runs each beat.
  */
 
-export const CACHE_KEEPALIVE_HEADER = "x-meridian-cache-keepalive"
+/** Lifetime of the one-hour cache tier; each read restarts it. */
+export const PROMPT_CACHE_TTL_MS = 60 * 60_000
 
-/** Anthropic's default prompt-cache lifetime; each read restarts it. */
-export const PROMPT_CACHE_TTL_MS = 5 * 60_000
+/** A beat is due this long after the latest real turn or beat started. */
+export const CACHE_KEEPALIVE_INTERVAL_MS = 55 * 60_000
 
-/** Refresh this long before the prefix would expire. */
-export const CACHE_KEEPALIVE_LEAD_MS = 60_000
+/** Beats per idle period; a real turn starts a new period. */
+export const CACHE_KEEPALIVE_MAX_BEATS = 3
+
+/** Beats running at once, across every session. */
+export const CACHE_KEEPALIVE_DEFAULT_MAX_IN_FLIGHT = 1
+export const CACHE_KEEPALIVE_MAX_IN_FLIGHT_LIMIT = 2
 
 /** Quiet period after a newly published session before it may be refreshed. */
 export const CACHE_KEEPALIVE_SETTLE_MS = 15_000
 
-/** Back-off after a keepalive that never reached upstream. */
+/** Back-off after a beat that never reached upstream or was skipped. */
 export const CACHE_KEEPALIVE_RETRY_MS = 30_000
 
-/** Bounds one keepalive, including its wait for an SDK permit. */
+/** Bounds one beat, including SDK start-up. */
 export const CACHE_KEEPALIVE_TIMEOUT_MS = 45_000
 
 /** Appended after the cached prefix; the response is never read. */
 export const CACHE_KEEPALIVE_PROMPT = "Reply with OK."
 
-/** Beyond this many pending tool calls a keepalive would miss the cache. */
+/** Beyond this many pending tool calls a beat would miss the cache. */
 export const CACHE_KEEPALIVE_MAX_PENDING_TOOL_CALLS = 8
 
-/** `requestSource` on keepalive telemetry rows. */
+/** `requestSource` on beat telemetry rows. */
 export const CACHE_KEEPALIVE_SOURCE = "cache-keepalive"
 
 /**
- * Parse the header's keepalive window. Whole seconds only, clamped to the
- * operator's maximum; anything else leaves the session opted out.
+ * Whether the operator switched keepalive on. The environment wins over the
+ * setting so a deployment can force it either way; unset or unrecognized
+ * values fall through to the setting, and the default is off.
  */
-export function parseCacheKeepaliveWindow(value: string | undefined, maxSeconds: number): number | undefined {
-  if (value === undefined || maxSeconds <= 0) return undefined
-  const trimmed = value.trim()
-  if (!/^\d+$/.test(trimmed)) return undefined
-  const seconds = Math.min(Number(trimmed), maxSeconds)
-  return seconds > 0 ? seconds * 1000 : undefined
+export function resolveCacheKeepaliveEnabled(envValue: string | undefined, setting: () => unknown): boolean {
+  const value = envValue?.trim().toLowerCase()
+  if (value === "1" || value === "true" || value === "yes" || value === "on") return true
+  if (value === "0" || value === "false" || value === "no" || value === "off") return false
+  return setting() === true
+}
+
+/** Concurrent beats allowed; clamped to a small number. */
+export function resolveCacheKeepaliveMaxInFlight(envValue: number | undefined): number {
+  if (envValue === undefined || !Number.isFinite(envValue)) return CACHE_KEEPALIVE_DEFAULT_MAX_IN_FLIGHT
+  return Math.min(CACHE_KEEPALIVE_MAX_IN_FLIGHT_LIMIT, Math.max(1, Math.trunc(envValue)))
+}
+
+/** Usage fields that say which cache tier a request wrote. */
+export interface CacheTierUsage {
+  cache_read_input_tokens?: number | null
+  cache_creation?: {
+    ephemeral_1h_input_tokens?: number | null
+    ephemeral_5m_input_tokens?: number | null
+  } | null
+}
+
+/**
+ * Which tier a turn's usage shows.
+ *
+ * - `1h`: it wrote only to the one-hour tier.
+ * - `5m`: it wrote anything to the five-minute tier. Part of the prefix then
+ *   expires within minutes and a beat an hour later would rewrite it.
+ * - `read`: it wrote nothing and read from the cache, so its tier is whatever
+ *   the session already had.
+ * - `none`: no cache information at all.
+ */
+export type CacheTier = "1h" | "5m" | "read" | "none"
+
+export function classifyCacheTier(usage: CacheTierUsage | undefined): CacheTier {
+  if (!usage) return "none"
+  const creation = usage.cache_creation
+  const fiveMinute = creation?.ephemeral_5m_input_tokens ?? 0
+  const oneHour = creation?.ephemeral_1h_input_tokens ?? 0
+  if (fiveMinute > 0) return "5m"
+  if (oneHour > 0) return "1h"
+  if (creation && (usage.cache_read_input_tokens ?? 0) > 0) return "read"
+  return "none"
+}
+
+/** What the account looks like when a beat is about to start. */
+export interface CacheKeepaliveAccountFacts {
+  profileType: string
+  /** Latest usage windows observed for the account. */
+  rateLimits: ReadonlyArray<{
+    status?: string
+    utilization?: number
+    resetsAt?: number
+    isUsingOverage?: boolean
+  }>
+  /** Priority routing has the account in cooldown. */
+  coolingDown: boolean
+  /** A recent refusal marked the account spent. */
+  spent: boolean
+  /** The session's [1m] model is benched, so the next turn uses another model. */
+  benched: boolean
+  now: number
+}
+
+/**
+ * Why a beat must not run on this account now, or undefined when it may.
+ *
+ * A beat is billed like any other request, so it never runs where that bill
+ * is real money (API keys, Extra Usage) or where it would spend a window that
+ * is already exhausted.
+ */
+export function cacheKeepaliveAccountBlock(facts: CacheKeepaliveAccountFacts): string | undefined {
+  if (facts.profileType !== "claude-max") return "not-subscription"
+  const live = facts.rateLimits.filter(entry => entry.resetsAt === undefined || entry.resetsAt > facts.now)
+  if (live.some(entry => entry.isUsingOverage === true)) return "overage"
+  if (live.some(entry => entry.status === "rejected" || (entry.utilization ?? 0) >= 1)) return "rate-limited"
+  if (facts.coolingDown) return "cooldown"
+  if (facts.spent) return "spent"
+  if (facts.benched) return "benched"
+  return undefined
 }
 
 export interface CacheKeepaliveState {
-  /** Start of the session's latest upstream request. */
-  lastRequestAt: number
-  /** No keepalive starts at or after this time. */
-  windowEndsAt: number
-  /** Start of the latest keepalive, and the SDK session it refreshed. */
+  /** Start of the session's latest real turn. */
+  lastTurnAt: number
+  /** Beats that reached upstream since that turn. */
+  beats: number
+  /** Start of the latest beat that reached upstream, and the session it refreshed. */
   lastBeat?: { sessionId: string; at: number }
-  /** Earliest retry after a keepalive that never reached upstream. */
+  /** Earliest retry after a beat that never reached upstream. */
   retryAt?: number
   /** When a tick first saw the mapping move to this SDK session. */
   sessionSeen?: { sessionId: string; at: number }
@@ -77,11 +148,25 @@ export interface CacheKeepaliveState {
 
 export type CacheKeepaliveDecision = "wait" | "beat" | "expire"
 
+export interface CacheKeepaliveTiming {
+  intervalMs: number
+  ttlMs: number
+  maxBeats: number
+  settleMs: number
+}
+
+const DEFAULT_TIMING: CacheKeepaliveTiming = {
+  intervalMs: CACHE_KEEPALIVE_INTERVAL_MS,
+  ttlMs: PROMPT_CACHE_TTL_MS,
+  maxBeats: CACHE_KEEPALIVE_MAX_BEATS,
+  settleMs: CACHE_KEEPALIVE_SETTLE_MS,
+}
+
 /**
  * Decide what to do for one session at `now`, given the SDK session its
  * mapping currently resumes.
  *
- * A keepalive only refreshes the session it ran against, so its time stops
+ * A beat only refreshes the session it ran against, so its time stops
  * counting once the mapping moves to a newer session. An expired prefix is
  * not refreshed: that would rewrite the whole conversation for a turn that
  * may never come.
@@ -90,32 +175,44 @@ export function decideCacheKeepalive(
   state: CacheKeepaliveState,
   currentSessionId: string | undefined,
   now: number,
-  ttlMs: number = PROMPT_CACHE_TTL_MS,
-  leadMs: number = CACHE_KEEPALIVE_LEAD_MS,
-  settleMs: number = CACHE_KEEPALIVE_SETTLE_MS,
+  timing: CacheKeepaliveTiming = DEFAULT_TIMING,
 ): CacheKeepaliveDecision {
-  if (now >= state.windowEndsAt) return "expire"
+  if (state.beats >= timing.maxBeats) return "expire"
+  const anchor = currentSessionId && state.lastBeat?.sessionId === currentSessionId
+    ? Math.max(state.lastBeat.at, state.lastTurnAt)
+    : state.lastTurnAt
+  if (now >= anchor + timing.ttlMs) return "expire"
   if (!currentSessionId) return "wait"
-  const anchor = state.lastBeat?.sessionId === currentSessionId
-    ? Math.max(state.lastBeat.at, state.lastRequestAt)
-    : state.lastRequestAt
-  if (now >= anchor + ttlMs) return "expire"
-  if (now < anchor + ttlMs - leadMs) return "wait"
+  if (now < anchor + timing.intervalMs) return "wait"
   if (state.retryAt !== undefined && now < state.retryAt) return "wait"
-  if (state.sessionSeen?.sessionId === currentSessionId && now < state.sessionSeen.at + settleMs) return "wait"
+  if (state.sessionSeen?.sessionId === currentSessionId && now < state.sessionSeen.at + timing.settleMs) return "wait"
   return "beat"
 }
+
+/**
+ * How one beat ended:
+ * - `reached`: upstream read the prefix; it counts toward the idle period.
+ * - `retry`: it did not run or never reached upstream; try again shortly.
+ * - `stop`: keeping this session warm is pointless (cache already gone,
+ *   five-minute tier, mapping gone); stop tracking it.
+ */
+export type CacheKeepaliveBeatOutcome = "reached" | "retry" | "stop"
 
 export interface CacheKeepaliveSchedulerOptions<R> {
   /** The SDK session the recipe's mapping currently resumes, if any. */
   currentSessionId(recipe: R): string | undefined
-  /** Run one keepalive; resolves true once the request reached upstream. */
-  beat(recipe: R, sessionId: string, signal: AbortSignal): Promise<boolean>
+  /** Run one beat. */
+  beat(recipe: R, sessionId: string, signal: AbortSignal): Promise<CacheKeepaliveBeatOutcome>
+  /** Whether the operator has keepalive switched on; re-read on every tick. */
+  enabled?: () => boolean
   now?: () => number
+  intervalMs?: number
   ttlMs?: number
-  leadMs?: number
+  maxBeats?: number
   settleMs?: number
   retryMs?: number
+  /** Beats running at once across every session. */
+  maxInFlight?: number
 }
 
 interface Entry<R> {
@@ -126,46 +223,86 @@ interface Entry<R> {
   observed?: { sessionId: string | undefined }
 }
 
-/** Tracks opted-in sessions and starts their keepalives when `tick` finds one due. */
+/** What a finished real turn tells the scheduler. */
+export interface CacheKeepaliveTurn<R> {
+  recipe: R
+  /** When the turn's SDK query started; the cache was read then. */
+  startedAt: number
+  /** Tier the turn's usage showed; `none` also covers a failed turn. */
+  tier: CacheTier
+}
+
+/** Tracks eligible idle sessions and starts their beats when `tick` finds one due. */
 export class CacheKeepaliveScheduler<R> {
   private readonly entries = new Map<string, Entry<R>>()
-  /** Separate from entries: a stopped keepalive counts until its SDK child is joined. */
+  /** Real turns running per key; a session with one is not idle. */
+  private readonly turns = new Map<string, number>()
+  /** Separate from entries: a stopped beat counts until its SDK child is joined. */
   private readonly running = new Set<AbortController>()
   private readonly now: () => number
+  private readonly timing: CacheKeepaliveTiming
+  private readonly maxInFlight: number
   private stopped = false
 
   constructor(private readonly options: CacheKeepaliveSchedulerOptions<R>) {
     this.now = options.now ?? Date.now
+    this.timing = {
+      intervalMs: options.intervalMs ?? CACHE_KEEPALIVE_INTERVAL_MS,
+      ttlMs: options.ttlMs ?? PROMPT_CACHE_TTL_MS,
+      maxBeats: options.maxBeats ?? CACHE_KEEPALIVE_MAX_BEATS,
+      settleMs: options.settleMs ?? CACHE_KEEPALIVE_SETTLE_MS,
+    }
+    this.maxInFlight = Math.max(1, options.maxInFlight ?? CACHE_KEEPALIVE_DEFAULT_MAX_IN_FLIGHT)
   }
 
-  /** Record an upstream request for `key`, starting or extending its window. */
-  noteRequest(key: string, recipe: R, windowMs: number, startedAt: number): void {
+  /** A real turn on `key` started: the session is no longer idle. */
+  noteTurnStart(key: string, startedAt: number): void {
+    if (this.stopped) return
+    this.turns.set(key, (this.turns.get(key) ?? 0) + 1)
+    const entry = this.entries.get(key)
+    if (!entry) return
+    entry.state.lastTurnAt = Math.max(entry.state.lastTurnAt, startedAt)
+    entry.state.beats = 0
+    entry.state.retryAt = undefined
+  }
+
+  /**
+   * A real turn on `key` ended. One that wrote the one-hour tier starts a new
+   * idle period; one that only read keeps the session's existing period
+   * going from its start; anything else stops tracking the session.
+   */
+  noteTurnEnd(key: string, turn: CacheKeepaliveTurn<R>): void {
+    const running = (this.turns.get(key) ?? 1) - 1
+    if (running > 0) this.turns.set(key, running)
+    else this.turns.delete(key)
     if (this.stopped) return
     const entry = this.entries.get(key)
-    if (entry) {
-      entry.recipe = recipe
-      entry.state.lastRequestAt = Math.max(entry.state.lastRequestAt, startedAt)
-      entry.state.windowEndsAt = entry.state.lastRequestAt + windowMs
-      entry.state.retryAt = undefined
+    if (turn.tier === "1h" || (turn.tier === "read" && entry)) {
+      if (entry) {
+        entry.recipe = turn.recipe
+        entry.state.lastTurnAt = Math.max(entry.state.lastTurnAt, turn.startedAt)
+        entry.state.beats = 0
+        entry.state.retryAt = undefined
+        return
+      }
+      this.entries.set(key, { recipe: turn.recipe, state: { lastTurnAt: turn.startedAt, beats: 0 } })
       return
     }
-    this.entries.set(key, {
-      recipe,
-      state: { lastRequestAt: startedAt, windowEndsAt: startedAt + windowMs },
-    })
+    this.entries.delete(key)
   }
 
-  /** Stop tracking `key`. A running keepalive finishes on its own. */
+  /** Stop tracking `key`. A running beat finishes on its own. */
   forget(key: string): void {
     this.entries.delete(key)
   }
 
-  /** Start every keepalive that is due. Never waits for one to finish. */
+  /** Start every beat that is due, up to the in-flight cap. Never waits for one. */
   tick(): void {
-    if (this.stopped) return
-    const ttlMs = this.options.ttlMs ?? PROMPT_CACHE_TTL_MS
-    const leadMs = this.options.leadMs ?? CACHE_KEEPALIVE_LEAD_MS
-    const settleMs = this.options.settleMs ?? CACHE_KEEPALIVE_SETTLE_MS
+    if (this.stopped || this.entries.size === 0) return
+    if (this.options.enabled && !this.options.enabled()) {
+      this.entries.clear()
+      return
+    }
     for (const [key, entry] of this.entries) {
       if (entry.running) continue
       const now = this.now()
@@ -180,29 +317,36 @@ export class CacheKeepaliveScheduler<R> {
         entry.state.sessionSeen = { sessionId, at: now }
       }
       entry.observed = { sessionId }
-      const decision = decideCacheKeepalive(entry.state, sessionId, now, ttlMs, leadMs, settleMs)
+      if ((this.turns.get(key) ?? 0) > 0) continue
+      const decision = decideCacheKeepalive(entry.state, sessionId, now, this.timing)
       if (decision === "expire") {
         this.entries.delete(key)
-      } else if (decision === "beat" && sessionId) {
-        this.start(entry, sessionId, now)
+      } else if (decision === "beat" && sessionId && this.running.size < this.maxInFlight) {
+        this.start(key, entry, sessionId, now)
       }
     }
   }
 
-  private start(entry: Entry<R>, sessionId: string, now: number): void {
-    const previousBeat = entry.state.lastBeat
-    // The prefix is refreshed when the request is received, so the new anchor
-    // is this start time. It is rolled back if the request never got there.
-    entry.state.lastBeat = { sessionId, at: now }
+  private start(key: string, entry: Entry<R>, sessionId: string, now: number): void {
     const running = new AbortController()
     entry.running = running
     this.running.add(running)
-    const failed = (): void => {
-      if (entry.state.lastBeat?.at === now) entry.state.lastBeat = previousBeat
-      entry.state.retryAt = now + (this.options.retryMs ?? CACHE_KEEPALIVE_RETRY_MS)
+    const settle = (outcome: CacheKeepaliveBeatOutcome): void => {
+      if (this.entries.get(key) !== entry) return
+      if (outcome === "stop") {
+        this.entries.delete(key)
+      } else if (outcome === "retry") {
+        entry.state.retryAt = now + (this.options.retryMs ?? CACHE_KEEPALIVE_RETRY_MS)
+      } else if (entry.state.lastTurnAt <= now) {
+        // The prefix is refreshed when the request is received, so the new
+        // anchor is this start time. A turn that started meanwhile already
+        // began a new idle period and owns the count.
+        entry.state.lastBeat = { sessionId, at: now }
+        entry.state.beats++
+      }
     }
     this.options.beat(entry.recipe, sessionId, running.signal)
-      .then((reached) => { if (!reached) failed() }, failed)
+      .then(settle, () => settle("retry"))
       .finally(() => {
         this.running.delete(running)
         if (entry.running === running) entry.running = undefined
@@ -214,15 +358,16 @@ export class CacheKeepaliveScheduler<R> {
     return this.entries.size
   }
 
-  /** Keepalives that have not settled yet, including aborted ones. */
+  /** Beats that have not settled yet, including aborted ones. */
   get inFlight(): number {
     return this.running.size
   }
 
-  /** Abort running keepalives and stop tracking. Used on drain. */
+  /** Abort running beats and stop tracking. Used on drain. */
   stop(): void {
     this.stopped = true
     for (const running of this.running) running.abort(new Error("Cache keepalive stopped"))
     this.entries.clear()
+    this.turns.clear()
   }
 }

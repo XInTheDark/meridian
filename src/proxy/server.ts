@@ -39,9 +39,17 @@ import { guardUpstreamIdle, UpstreamIdleError, type LateIdleDeadline } from "./s
 import { IdleStallCeilingError, IdleStallTracker, idleStallRequestKey } from "./idleStallCeiling"
 import { linkRequestAbort, type RequestAbortLink } from "./requestAbort"
 import { processSessionTree, truncateSessionKey, type SessionTreeRegistration } from "./sessionTree"
-import { CACHE_KEEPALIVE_HEADER, CacheKeepaliveScheduler, parseCacheKeepaliveWindow } from "./cacheKeepalive"
+import {
+  CacheKeepaliveScheduler,
+  cacheKeepaliveAccountBlock,
+  classifyCacheTier,
+  resolveCacheKeepaliveEnabled,
+  resolveCacheKeepaliveMaxInFlight,
+  type CacheTierUsage,
+} from "./cacheKeepalive"
 import {
   cacheKeepaliveOptions,
+  cacheTierUsageOf,
   createCacheKeepaliveRunner,
   currentCacheKeepaliveSessionId,
   type CacheKeepaliveRecipe,
@@ -58,7 +66,7 @@ import { resolveSdkWorkingDirectory } from "./cwd"
 import type { Context } from "hono"
 import { DEFAULT_PROXY_CONFIG, resolveBackendConfig } from "./types"
 import { createAntigravityServer } from "./backends/antigravity"
-import { env, envBool, envInt, envVarSource } from "../env"
+import { env, envBool, envInt, envIntValue, envVarSource } from "../env"
 import { installErrorReporter } from "../errorReporting"
 import type { ProxyConfig, ProxyInstance, ProxyServer } from "./types"
 export type { ProxyConfig, ProxyInstance, ProxyServer }
@@ -127,7 +135,7 @@ import { buildRuntime } from "./buildRuntime"
 import { checkPluginsNow, getLatestVersion, isUpdateCheckEnabled, startUpdateCheck, stopUpdateCheck } from "./updateCheck"
 import { getPluginUpdates, trackPlugins } from "./pluginUpdateCheck"
 import { createAuthStatusOwner } from "./authStatusOwnership"
-import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, subscriptionIncludesExtendedContext } from "./models"
+import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, explicitModelPin, CANONICAL_SONNET_MODEL, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, expireAuthStatusCache, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable, recordExtendedContextRateLimited, isExtendedContextKnownUnavailable, subscriptionIncludesExtendedContext } from "./models"
 import { livenessReport, readinessReport, renderProbe } from "./probes"
 import { UpstreamReachability, DEFAULT_OVERRIDE_TTL_MS, MAX_OVERRIDE_TTL_MS, unreachableDetail, withReachability } from "./upstreamReachability"
 import { resolveReachabilityThresholds } from "./upstreamReachabilityConfig"
@@ -400,14 +408,13 @@ interface RequestMeta {
    * lease, so skipping the lease and skipping session lookup cannot disagree.
    */
   auxiliaryRequest?: boolean
-  /** Set on a keyed passthrough turn whose client opted into cache keepalive. */
+  /** Set on a real turn of a session prompt-cache keepalive may track. */
   cacheKeepalive?: CacheKeepaliveRegistration
 }
 
 interface CacheKeepaliveRegistration {
   key: string
-  windowMs: number
-  recipe: Omit<CacheKeepaliveRecipe, "options">
+  recipe: Omit<CacheKeepaliveRecipe, "options" | "extendedContext">
 }
 
 interface PriorityAttemptExposure {
@@ -1233,6 +1240,59 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     requestMeta.sdkQueueWaitMs += lease.waitedMs
     const startedAt = Date.now()
     requestMeta.currentSdkStartedAt = startedAt
+    const keepalive = requestMeta.cacheKeepalive
+    if (!keepalive) {
+      try {
+        yield* runGatedSdkQuery(params, signal, lease, mode, activeLocators)
+      } finally {
+        requestMeta.sdkActiveDurationMs += Date.now() - startedAt
+      }
+      return
+    }
+    // A real turn of a tracked session: it ends the idle period now, and its
+    // usage says whether the session is worth keeping warm afterwards.
+    const turnModel = params.options?.model ?? keepalive.recipe.model
+    const keepaliveRecipe: CacheKeepaliveRecipe = {
+      ...keepalive.recipe,
+      model: turnModel,
+      extendedContext: turnModel.endsWith("[1m]"),
+      options: cacheKeepaliveOptions(params.options ?? {}),
+    }
+    cacheKeepalive.noteTurnStart(keepalive.key, startedAt)
+    let cacheUsage: CacheTierUsage | undefined
+    let failed = false
+    try {
+      for await (const message of runGatedSdkQuery(params, signal, lease, mode, activeLocators)) {
+        // Only usage that breaks cache writes down by tier says anything.
+        const usage = cacheTierUsageOf(message)
+        if (usage?.cache_creation) cacheUsage = usage
+        yield message
+      }
+    } catch (error) {
+      failed = true
+      throw error
+    } finally {
+      requestMeta.sdkActiveDurationMs += Date.now() - startedAt
+      const tier = failed || signal.aborted ? "none" : classifyCacheTier(cacheUsage)
+      cacheKeepalive.noteTurnEnd(keepalive.key, { recipe: keepaliveRecipe, startedAt, tier })
+    }
+  }
+
+  /**
+   * One SDK query with its permit already held: process gate, close and join,
+   * and the writer lease on `activeLocators`. An empty list is a query that
+   * writes no transcript (a keepalive beat, `persistSession: false`); it is
+   * still gated and joined, but takes no writer lease that would refuse a
+   * real turn on the same transcript. The permit is released only after the
+   * child has been joined.
+   */
+  async function* runGatedSdkQuery(
+    params: Parameters<typeof query>[0],
+    signal: AbortSignal,
+    lease: SemaphoreLease,
+    mode: string,
+    activeLocators: readonly TranscriptLocator[],
+  ) {
     let sdkQuery: ReturnType<typeof query> | undefined
     let activeTranscriptLease: Awaited<ReturnType<typeof acquireActiveTranscriptLease>> | undefined
     let processGate: Awaited<ReturnType<typeof createSdkProcessGate>> | undefined
@@ -1242,34 +1302,25 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       for (const locator of activeLocators) {
         await ensureTranscriptJournaled(locator, admissionLifecycleOptions)
       }
-      activeTranscriptLease = await acquireActiveTranscriptLease(activeLocators, admissionLifecycleOptions)
+      if (activeLocators.length > 0) {
+        activeTranscriptLease = await acquireActiveTranscriptLease(activeLocators, admissionLifecycleOptions)
+      }
       signal.throwIfAborted()
       // Unit SDK doubles never create an OS child. Production and real E2E runs
       // always use the gated exact-incarnation writer path.
       if (process.env.MERIDIAN_TEST_DISABLE_SDK_PROCESS_GATE !== "1") {
+        const writerLease = activeTranscriptLease
         processGate = await createSdkProcessGate(
           join(getSessionStoreDir(), "sdk-process-gates"),
-          (executor, recoverableAfterCrash) => attachActiveTranscriptExecutor(
-            activeTranscriptLease!,
-            executor,
-            admissionLifecycleOptions,
-            recoverableAfterCrash,
-          ),
+          (executor, recoverableAfterCrash) => writerLease
+            ? attachActiveTranscriptExecutor(writerLease, executor, admissionLifecycleOptions, recoverableAfterCrash)
+            : Promise.resolve(),
           params.options?.stderr,
         )
         params.options ??= {}
         params.options.spawnClaudeCodeProcess = processGate.spawnClaudeCodeProcess
       }
       signal.throwIfAborted()
-      const keepalive = requestMeta.cacheKeepalive
-      if (keepalive && params.options) {
-        cacheKeepalive.noteRequest(
-          keepalive.key,
-          { ...keepalive.recipe, options: cacheKeepaliveOptions(params.options) },
-          keepalive.windowMs,
-          startedAt,
-        )
-      }
       sdkQuery = query(params)
       // Read outside the idle guard, never between it and the query: the guard
       // tears its source down without awaiting it, and a generator in between
@@ -1294,21 +1345,37 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           await releaseJoinedTranscriptLease(activeTranscriptLease, sessionGcOptions)
         }
       } finally {
-        requestMeta.sdkActiveDurationMs += Date.now() - startedAt
         lease.release()
       }
     }
   }
 
+  // Prompt-cache keepalive (src/proxy/SPEC.md → Decisions). Off unless the
+  // operator switches it on; beats run on the same gated SDK path as turns
+  // and count as in-flight work for shutdown.
+  const cacheKeepaliveEnabled = (): boolean =>
+    resolveCacheKeepaliveEnabled(env("CACHE_KEEPALIVE"), () => getSetting("cacheKeepalive"))
   const cacheKeepalive = new CacheKeepaliveScheduler<CacheKeepaliveRecipe>({
+    enabled: cacheKeepaliveEnabled,
+    maxInFlight: resolveCacheKeepaliveMaxInFlight(envIntValue("CACHE_KEEPALIVE_MAX_IN_FLIGHT")),
     currentSessionId: currentCacheKeepaliveSessionId,
     beat: createCacheKeepaliveRunner({
-      semaphore: sdkSemaphore,
+      // Never the last free permit: a client turn arriving mid-beat must not
+      // wait behind it.
+      tryAcquirePermit: () => sdkSemaphore.tryAcquire(1),
+      runQuery: (params, signal, lease) => runGatedSdkQuery(params, signal, lease, "cache_keepalive", []),
       pinTranscript: (locator) => pinActiveSessionGcLocators(locator),
       isDraining: () => draining,
+      accountBlock: (recipe) => cacheKeepaliveAccountBlock({
+        profileType: recipe.profileType,
+        rateLimits: rateLimitStore.getAll(recipe.profileId),
+        coolingDown: priorityExhaustion.isExhausted(recipe.profileId),
+        spent: spentProfiles.get(recipe.profileId) !== undefined,
+        benched: recipe.extendedContext && isExtendedContextKnownUnavailable(recipe.profileId, recipe.benchSessionKey),
+        now: Date.now(),
+      }),
     }),
   })
-  const cacheKeepaliveMaxSeconds = Math.max(0, envInt("CACHE_KEEPALIVE_MAX_SECONDS", 3600))
 
   const pluginDir = finalConfig.pluginDir ?? configPath("plugins")
   const pluginConfigPath = finalConfig.pluginConfigPath ?? configPath("plugins.json")
@@ -4309,32 +4376,34 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         }
       }
       const hasDeferredTools = passthroughMcp?.hasDeferredTools ?? false
-      // Opt-in cache keepalive (see cacheKeepalive.ts). Limited to keyed
-      // passthrough sessions: keepalives resume the stored mapping, and in
-      // passthrough every tool is a client stub, so nothing can execute here.
-      const cacheKeepaliveWindowMs = parseCacheKeepaliveWindow(
-        c.req.header(CACHE_KEEPALIVE_HEADER),
-        cacheKeepaliveMaxSeconds,
-      )
+      // Prompt-cache keepalive (src/proxy/SPEC.md → Decisions). Only a real
+      // turn of a keyed passthrough session on a subscription account is
+      // tracked: beats resume the stored mapping, and in passthrough every
+      // tool is a client stub, so nothing can execute. Side calls and other
+      // independent requests never touch the session's schedule.
       const cacheKeepaliveKey = agentSessionId ? `${adapter.name}:${agentSessionId}` : undefined
-      // The latest turn decides: one sent without the header opts the session out.
-      if (cacheKeepaliveKey && cacheKeepaliveWindowMs === undefined) cacheKeepalive.forget(cacheKeepaliveKey)
-      if (cacheKeepaliveKey && cacheKeepaliveWindowMs !== undefined && passthrough && profileSessionId && !isIndependentSession) {
-        const keepaliveMcp = passthroughMcp
-        requestMeta.cacheKeepalive = {
-          key: cacheKeepaliveKey,
-          windowMs: cacheKeepaliveWindowMs,
-          recipe: {
-            mappingKey: profileSessionId,
-            createMcpServers: () => {
-              if (!keepaliveMcp) return {}
-              return { [keepaliveMcp.serverName]: keepaliveMcp.createServer() }
+      requestMeta.cacheKeepalive = undefined
+      if (cacheKeepaliveKey && !isIndependentSession) {
+        if (passthrough && profileSessionId && profile.type === "claude-max" && cacheKeepaliveEnabled()) {
+          const keepaliveMcp = passthroughMcp
+          requestMeta.cacheKeepalive = {
+            key: cacheKeepaliveKey,
+            recipe: {
+              mappingKey: profileSessionId,
+              createMcpServers: () => {
+                if (!keepaliveMcp) return {}
+                return { [keepaliveMcp.serverName]: keepaliveMcp.createServer() }
+              },
+              adapterName: adapter.name,
+              profileId: profile.id,
+              profileType: profile.type,
+              benchSessionKey,
+              model,
+              requestModel: body.model || undefined,
             },
-            adapterName: adapter.name,
-            profileId: profile.id,
-            model,
-            requestModel: body.model || undefined,
-          },
+          }
+        } else {
+          cacheKeepalive.forget(cacheKeepaliveKey)
         }
       }
       // Count deferred tools: when auto-defer is active, non-core tools are deferred
@@ -12006,8 +12075,9 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   if (sweepSessionGc) void sweepSessionGc()
 
   // Same ownership rule as the GC sweep: only the owned server runs the timer.
-  // The tick only compares timestamps, so a short period costs little and
-  // keeps each keepalive well inside its lead before expiry.
+  // The tick only compares timestamps (and returns at once with nothing
+  // tracked), so a short period costs little and starts each beat within
+  // seconds of when it is due.
   const cacheKeepaliveInterval = tickCacheKeepalive
     ? setInterval(tickCacheKeepalive, 10_000)
     : undefined

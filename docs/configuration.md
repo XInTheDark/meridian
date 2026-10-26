@@ -53,7 +53,8 @@ Environment variables, endpoints, authentication, SDK feature toggles, passthrou
 | `MERIDIAN_SUPPRESS_SCRATCHPAD` | — | `1` | Set to `0` to disable prompt-level scratchpad suppression in passthrough mode (#627, #1049) |
 | `MERIDIAN_SUPPRESS_SCRATCHPAD_ENV` | — | `0` | Set to `1` to also pass `CLAUDE_CODE_SESSION_KIND=bg` to the SDK subprocess. Disabled by default to prevent CLI 2.1.274+ from registering persistent phantom background jobs under `~/.claude/jobs/` (#1049) |
 | `MERIDIAN_SUPPRESS_IMPLICIT_ATTACHMENTS` | — | `1` | Set to `0` to stop defaulting `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` in passthrough mode. Does not clear an explicitly inherited CLI setting. See [known limitations](#known-limitations). |
-| `MERIDIAN_CACHE_KEEPALIVE_MAX_SECONDS` | — | `3600` | Upper bound on the window a client can request with `x-meridian-cache-keepalive`. `0` disables [prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE` | — | unset (off) | Set to `1` to keep idle one-hour-cache sessions warm with a few small cache-read requests; `0` forces it off. Wins over `cacheKeepalive` in `settings.json`. See [Prompt-cache keepalive](#prompt-cache-keepalive). |
+| `MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT` | — | `1` | Keepalive requests allowed to run at once across all sessions, clamped to `1`–`2`. |
 | `MERIDIAN_COMPACTION_SURVIVAL` | — | `0` | Set to `1` to resume the old SDK session after a client shortens its history head into a summary. By default Meridian replays the supplied summary in a fresh SDK session so the removed context is released. Equal-length pruning still resumes. |
 | `MERIDIAN_CONFIG_DIR` | — | `~/.config/meridian` | Meridian's own config directory. Moving it moves everything inside it — see [below](#relocating-the-config-directory). |
 | `MERIDIAN_PRICING_CONFIG` | `CLAUDE_PROXY_PRICING_CONFIG` | `~/.config/meridian/model-pricing.json` | Path to the model pricing overrides file used by cost estimation |
@@ -204,7 +205,7 @@ second instance pointed at an empty directory starts genuinely empty:
 
 | File | Holds |
 |---|---|
-| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates`, page `layout` |
+| `settings.json` | Active profile, routing mode, priority order, `checkForUpdates`, `cacheKeepalive`, page `layout` |
 | `profiles.json` | Configured profiles ([Multi-Profile Support](profiles.md)) |
 | `profiles/<id>/` | Per-profile `CLAUDE_CONFIG_DIR` (credentials, SDK state) |
 | `adapter-instances.json` | [Adapter instances](agents.md#adapter-instances) |
@@ -1109,37 +1110,53 @@ a single turn.
 
 ### Prompt-cache keepalive
 
-Claude's prompt cache expires five minutes after the last request that used it,
-counted from when that request started. A pause longer than that, whether the
-user is reading or a client tool is running, makes the next turn write the
-whole conversation to the cache again.
+Off by default. When a session sits idle long enough for its prompt cache to
+expire, the next turn writes the whole conversation to the cache again. A
+Claude Max (subscription) session through the Agent SDK writes the one-hour
+cache tier, so short pauses already cost nothing; this only helps sessions
+left idle for more than an hour, such as a user away at a meeting.
 
-A client can ask Meridian to keep a session warm by sending
-`x-meridian-cache-keepalive: <seconds>` on its turns, for example `1800`. Until
-that many seconds have passed since the session's latest request started,
-Meridian refreshes the cache about a minute before it would expire. It resumes
-the session's stored transcript exactly as the next turn would, adds a short
-prompt, and stops as soon as the response starts, so almost no output is
-generated.
+Turn it on with `MERIDIAN_CACHE_KEEPALIVE=1`, or `"cacheKeepalive": true` in
+`settings.json` (the environment wins, and `MERIDIAN_CACHE_KEEPALIVE=0`
+forces it off). Both are re-read on every turn and every scheduler tick, so
+no restart is needed. There is no request header for it: the operator
+decides.
 
-- Only keyed passthrough sessions are kept warm. Each turn that sends the
-  header restarts the window. A turn without it, or with `0`, stops
+When it is on:
+
+- Only a keyed passthrough session on a `claude-max` profile is eligible, and
+  only while its latest real turn wrote the **one-hour** cache tier. A turn
+  that writes the five-minute tier (API keys, Extra Usage) or fails stops
   keepalives for that session.
+- About 55 minutes after the latest real turn, and 55 minutes after each
+  keepalive, Meridian resumes the session's stored transcript exactly as the
+  next turn would, adds a short prompt, and stops as soon as the response
+  starts. At most three keepalives per idle period (about three hours); after
+  that the cache is allowed to expire.
+- The next real turn on the session ends the idle period and starts a new one.
+  Side calls that share the session key (Claude Code's classifier and title
+  requests) do not.
 - Keepalives never change the session. They are not saved, so the next turn
-  resumes the same transcript it would have without them.
-- While a turn is still generating, keepalives refresh the previous turn's
-  cache. The new prefix is used once that turn has finished, after a
-  15-second pause that lets the client's next turn refresh it instead.
-- A keepalive is skipped when the cache has already expired, and at a tool
-  checkpoint with more than eight pending tool calls, where it could not reuse
-  the cache.
+  resumes the same transcript and mapping it would have without them.
+- A keepalive is skipped, not queued, when it would take the last free SDK
+  slot (`MERIDIAN_MAX_CONCURRENT`), when another keepalive is already running
+  (`MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT`), and while the session's account
+  is using Extra Usage, rate-limited, cooling down or benched from `[1m]`.
+  It always uses the account the session was published under and never fails
+  over to another profile.
+- It is skipped when the cache has already expired, and at a tool checkpoint
+  with more than eight pending tool calls, where it could not reuse the cache.
 - Each keepalive still counts toward subscription usage, at the cached-input
-  rate. With the default five-minute cache, a session idle for the whole
-  window gets one every four minutes.
+  rate.
+- Shutdown and drain stop new keepalives, abort a running one and wait for its
+  Claude Code process to exit, like any other request.
 
 Keepalives appear in `/telemetry` with `requestSource: "cache-keepalive"`.
-`MERIDIAN_CACHE_KEEPALIVE_MAX_SECONDS` caps the window (default `3600`); `0`
-turns the feature off.
+They are left out of the request, error, cache-hit and cost figures and shown
+separately (the **Cache Keepalive** section, `cacheKeepalive` in
+`GET /telemetry/summary`, and `meridian_cache_keepalive_beats_total` in
+`/metrics`). One that never reached upstream is a skipped refresh, not an
+error.
 
 ## Concurrent requests to the same session
 

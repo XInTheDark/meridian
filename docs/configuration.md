@@ -1125,7 +1125,8 @@ decides.
 
 When it is on:
 
-- Only a keyed passthrough session on a `claude-max` profile is eligible, and
+- Only a main conversation (not a subagent, title or summary request) of a
+  keyed passthrough session on a `claude-max` profile is eligible, and
   only while its latest real turn wrote the **one-hour** cache tier. A turn
   that writes the five-minute tier (API keys, Extra Usage) or that the client
   cancels stops keepalives for that session; a turn that stops at a tool call

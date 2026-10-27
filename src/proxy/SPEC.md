@@ -108,6 +108,17 @@ Contract*, *Cancellation Contract*; public routes and headers are in
     bounds the cost of a session that never comes back. A real turn ends the
     period (and no beat runs while one is running); auxiliary/independent
     requests never touch the schedule.
+  - *Main conversations only.* Subagent and one-shot requests (OpenCode's
+    title and summary, delegated children) are never tracked: the live A/B
+    showed OpenCode's title request keyed apart and carrying the full prefix,
+    so a beat on it cost as much as the useful one for a conversation never
+    resumed. They do not forget the key either, because an older V2 plugin
+    sends compaction as a subagent source under the primary key.
+  - *Measured* (2026-10-27, OpenCode 1.18.34, Sonnet 5.5, Max account, ~90k
+    token unique prefix, 65 min idle): without keepalive the next turn
+    rewrote 86,385 tokens; with it, one beat at 55.3 min read 90,018 and the
+    next turn read 90,018 and wrote 340, about 89% cheaper in input-token
+    equivalents net of the beat.
   - *Never on someone's money or an exhausted window.* No beat on API-key or
     token profiles, while any live window reports `isUsingOverage`, a
     rejected or fully used window, priority cooldown, a spent refusal, or a

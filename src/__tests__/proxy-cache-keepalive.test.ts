@@ -234,6 +234,31 @@ describe("cache keepalive", () => {
     expect(beatCalls()).toHaveLength(1)
   })
 
+  it("keeps only the main conversation warm, not OpenCode's title one-shot", async () => {
+    // Seen live (#1193 A/B): the title request gets its own key and carries
+    // the full prefix, but OpenCode never resumes it.
+    process.env.MERIDIAN_CACHE_KEEPALIVE = "1"
+    const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const start = Date.now()
+    await turn(proxy, { "x-opencode-session": "ses_titled", "x-opencode-agent-mode": "primary", "x-opencode-agent-name": "build" })
+    await turn(proxy, { "x-opencode-session": "ses_titled", "x-opencode-agent-mode": "subagent", "x-opencode-agent-name": "title" })
+    await tickAt(proxy, start + INTERVAL + 1_000)
+    await tickAt(proxy, start + INTERVAL + 31_000)
+    await tickAt(proxy, start + INTERVAL + 61_000)
+    expect(beatCalls()).toHaveLength(1)
+    expect(beatCalls()[0]!.options.resume).toBe(lookupSharedSession("ses_titled")!.claudeSessionId)
+  })
+
+  it("leaves the primary schedule alone when an older plugin sends compaction as a subagent source", async () => {
+    process.env.MERIDIAN_CACHE_KEEPALIVE = "1"
+    const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const start = Date.now()
+    await turn(proxy, { "x-opencode-session": "ses_oldv2", "x-opencode-agent-mode": "primary" })
+    await turn(proxy, { "x-opencode-session": "ses_oldv2", "x-opencode-agent-mode": "primary", "x-meridian-source": "subagent-compaction" })
+    await tickAt(proxy, start + INTERVAL + 1_000)
+    expect(beatCalls()).toHaveLength(1)
+  })
+
   it("beats at most three times per idle period, then lets the cache expire", async () => {
     process.env.MERIDIAN_CACHE_KEEPALIVE = "1"
     const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })

@@ -4393,7 +4393,10 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // independent requests never touch the session's schedule.
       const cacheKeepaliveKey = agentSessionId ? `${adapter.name}:${agentSessionId}` : undefined
       requestMeta.cacheKeepalive = undefined
-      if (cacheKeepaliveKey && !isIndependentSession) {
+      // Subagent and one-shot requests (title, summary, delegated children) are
+      // neither tracked nor forgotten: an older V2 plugin sends compaction as a
+      // subagent source under the primary key, which must keep its schedule.
+      if (cacheKeepaliveKey && !isIndependentSession && !isSubagentRequest) {
         if (passthrough && profileSessionId && profile.type === "claude-max" && cacheKeepaliveEnabled()) {
           const keepaliveMcp = passthroughMcp
           requestMeta.cacheKeepalive = {

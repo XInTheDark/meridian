@@ -143,15 +143,25 @@ export function createCacheKeepaliveRunner(deps: CacheKeepaliveRunnerDeps) {
         includePartialMessages: true,
       },
     }
+    // Pin before taking the permit: nothing may throw between taking it and
+    // handing it to the gated query, which releases it.
+    let releasePin: () => void
+    try {
+      releasePin = deps.pinTranscript(source)
+    } catch {
+      return skip("transcript-unpinnable", "stop")
+    }
     const lease = deps.tryAcquirePermit()
-    if (!lease) return skip("no-free-permit", "retry")
+    if (!lease) {
+      releasePin()
+      return skip("no-free-permit", "retry")
+    }
 
     const startedAt = Date.now()
     const stop = (): void => abort.abort(signal.reason)
     signal.addEventListener("abort", stop, { once: true })
     const timeout = setTimeout(() => abort.abort(new Error("Cache keepalive timed out")), CACHE_KEEPALIVE_TIMEOUT_MS)
     timeout.unref?.()
-    const releasePin = deps.pinTranscript(source)
     let usage: BeatUsage | undefined
     let error: string | null = null
     let ttfbMs: number | null = null

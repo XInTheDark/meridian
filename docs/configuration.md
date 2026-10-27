@@ -1126,8 +1126,9 @@ When it is on:
 
 - Only a keyed passthrough session on a `claude-max` profile is eligible, and
   only while its latest real turn wrote the **one-hour** cache tier. A turn
-  that writes the five-minute tier (API keys, Extra Usage) or fails stops
-  keepalives for that session.
+  that writes the five-minute tier (API keys, Extra Usage) or that the client
+  cancels stops keepalives for that session; a turn that stops at a tool call
+  keeps them.
 - About 55 minutes after the latest real turn, and 55 minutes after each
   keepalive, Meridian resumes the session's stored transcript exactly as the
   next turn would, adds a short prompt, and stops as soon as the response
@@ -1139,7 +1140,7 @@ When it is on:
 - Keepalives never change the session. They are not saved, so the next turn
   resumes the same transcript and mapping it would have without them.
 - A keepalive is skipped, not queued, when it would take the last free SDK
-  slot (`MERIDIAN_MAX_CONCURRENT`), when another keepalive is already running
+  slot (`MERIDIAN_MAX_CONCURRENT`; with a limit of `1` keepalive never runs), when another keepalive is already running
   (`MERIDIAN_CACHE_KEEPALIVE_MAX_IN_FLIGHT`), and while the session's account
   is using Extra Usage, rate-limited, cooling down or benched from `[1m]`.
   It always uses the account the session was published under and never fails

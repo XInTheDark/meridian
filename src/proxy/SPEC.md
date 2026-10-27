@@ -129,6 +129,11 @@ Contract*, *Cancellation Contract*; public routes and headers are in
     `DISABLE_AUTO_COMPACT`, stopped at `message_start`: no transcript, mapping
     or lineage change. A beat that read nothing (cache already gone) or wrote
     the five-minute tier stops tracking instead of paying again.
+  - *The tier is a fact of the request upstream received.* A turn's tier is
+    read from the usage it reported, whatever ended it: a tool-boundary stop
+    (the single-turn cap's `max_turns`, the single-step abort) keeps the
+    session tracked, since an agent waiting at a tool call is the main case.
+    Only a client abort, which evicts the session, drops tracking.
 
 ## Codex Responses wire contract
 
@@ -152,6 +157,12 @@ response response.created → response.in_progress → output_item.added →
 
 ## Known limitations
 
+- **Keepalive needs two SDK slots.** A beat never takes the last free permit,
+  so with `MERIDIAN_MAX_CONCURRENT=1` keepalive never runs.
+- **Keepalive tracking is unbounded in count.** Each tracked session holds its
+  latest request recipe (system prompt, tool definitions) for up to about
+  three idle hours; a busy shared instance with keepalive on holds one per
+  active session.
 - **Bun misses early disconnects:** under Bun the HTTP server does not notice a
   client that leaves before the first byte (a startup warning says so).
 - **Anthropic server tools** (`web_search_*`, `web_fetch_*`) cannot be produced

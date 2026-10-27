@@ -45,8 +45,11 @@ Code: `src/proxy/session/`, plus `sessionStore.ts`, `sessionLifecycle.ts` and
   a published mapping: it resumes the mapping's current transcript as a
   non-persisted fork, takes no writer or publication lease, and never
   publishes, invalidates or reclassifies anything. The session's mapping,
-  transcript and lineage are byte-identical before and after a beat; the
-  source transcript is pinned against GC until the beat's child is joined.
+  transcript and lineage are byte-identical before and after a beat. The
+  source transcript is pinned against this process's GC until the beat's
+  child is joined; collectors in other processes ignore that private pin, but
+  the published mapping retains the source, and if another process retires it
+  anyway the beat only fails and is retried or stopped.
 
 Detailed contracts live in [`architecture`](../../../ARCHITECTURE.md): *Session
 Management*, *Lineage Verification*, *SQLite bookkeeping boundary*, *Transcript

@@ -307,6 +307,8 @@ export type { LineageResult }
 
 
 const exec = promisify(execCallback)
+/** Abort reason of the passthrough single-step stop: a normal tool-boundary end, not a client abort. */
+const PASSTHROUGH_SINGLE_STEP_ABORT_REASON = "passthrough single-step complete"
 
 // Max gap between real upstream messages before we treat the stream as stalled.
 // Must be > slowest legitimate TTFB / server-side thinking pause, and < the
@@ -1260,7 +1262,6 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
     }
     cacheKeepalive.noteTurnStart(keepalive.key, startedAt)
     let cacheUsage: CacheTierUsage | undefined
-    let failed = false
     try {
       for await (const message of runGatedSdkQuery(params, signal, lease, mode, activeLocators)) {
         // Only usage that breaks cache writes down by tier says anything.
@@ -1268,12 +1269,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         if (usage?.cache_creation) cacheUsage = usage
         yield message
       }
-    } catch (error) {
-      failed = true
-      throw error
     } finally {
       requestMeta.sdkActiveDurationMs += Date.now() - startedAt
-      const tier = failed || signal.aborted ? "none" : classifyCacheTier(cacheUsage)
+      // See proxy-core spec: the cache tier is a fact of the request upstream
+      // received, so a tool-boundary stop (max_turns, single-step abort) keeps
+      // it; only a client abort, which evicts the session, drops tracking.
+      const clientAborted = signal.aborted && signal.reason !== PASSTHROUGH_SINGLE_STEP_ABORT_REASON
+      const tier = clientAborted ? "none" : classifyCacheTier(cacheUsage)
       cacheKeepalive.noteTurnEnd(keepalive.key, { recipe: keepaliveRecipe, startedAt, tier })
     }
   }
@@ -4566,7 +4568,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   // subprocess; the abort-shaped termination is converted into a
                   // clean stop_reason:"tool_use" response by the recovery paths.
                   requestAbort.setCause("passthrough_single_step")
-                  requestAbort.abort("passthrough single-step complete")
+                  requestAbort.abort(PASSTHROUGH_SINGLE_STEP_ABORT_REASON)
                 } else {
                   capturedSignatures.add(signature)
                   capturedToolNames.add(toolName)

@@ -45,6 +45,8 @@ let mcpServersCreated = 0
 let turnTier: "1h" | "5m" = "1h"
 /** When set, a beat waits for its abort and then this long before ending. */
 let holdBeatsAfterAbortMs: number | undefined
+/** When set, real turns end the way a capped tool-boundary turn does: the SDK throws max_turns. */
+let endTurnsAtMaxTurns = false
 
 const beatCalls = () => queryCalls.filter(call => call.options.persistSession === false)
 
@@ -100,6 +102,9 @@ installSdkMock(() => ({
           model: "claude-sonnet-4-5", stop_reason: "end_turn", usage,
         },
         session_id: sessionId,
+      }
+      if (!keepalive && endTurnsAtMaxTurns) {
+        throw new Error("Claude Code returned an error result: Reached maximum number of turns (1)")
       }
       yield { type: "result", subtype: "success", result: "done", session_id: sessionId, usage }
     })()
@@ -163,6 +168,7 @@ describe("cache keepalive", () => {
     mcpServersCreated = 0
     turnTier = "1h"
     holdBeatsAfterAbortMs = undefined
+    endTurnsAtMaxTurns = false
     telemetryStore.clear()
   })
 
@@ -213,6 +219,19 @@ describe("cache keepalive", () => {
 
     // The mapping, its transcript and lineage are exactly what the turn published.
     expect(JSON.stringify(lookupSharedSession("ses_keep"))).toBe(publishedJson)
+  })
+
+  it("keeps a session warm after a turn that ended at its tool-boundary turn cap", async () => {
+    // The single-turn cap makes max_turns the ordinary end of a passthrough
+    // turn; upstream already wrote the one-hour tier when it got the request.
+    process.env.MERIDIAN_CACHE_KEEPALIVE = "1"
+    endTurnsAtMaxTurns = true
+    const proxy = createProxyServer({ port: 0, host: "127.0.0.1" })
+    const start = Date.now()
+    await turn(proxy, { "x-opencode-session": "ses_capped" })
+    expect(lookupSharedSession("ses_capped")).toBeDefined()
+    await tickAt(proxy, start + INTERVAL + 1_000)
+    expect(beatCalls()).toHaveLength(1)
   })
 
   it("beats at most three times per idle period, then lets the cache expire", async () => {

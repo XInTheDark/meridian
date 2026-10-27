@@ -83,6 +83,11 @@ describe("computeSummary with keepalive beats", () => {
     expect(summary.cacheKeepalive.estimatedUsd).toBeGreaterThan(0)
   })
 
+  it("counts a beat that got usage back as reached even when joining its child failed", () => {
+    const summary = computeSummary([beat({ error: "SDK child did not close" })], 3_600_000)
+    expect(summary.cacheKeepalive).toMatchObject({ beats: 1, reached: 1, notReached: 0 })
+  })
+
   it("reports beats even when the window holds no requests", () => {
     const summary = computeSummary([beat()], 3_600_000)
     expect(summary.totalRequests).toBe(0)

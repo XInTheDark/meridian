@@ -44,7 +44,9 @@ function summarizeCacheKeepalive(
     estimatedUsd: beats.length > 0 ? computeCostEstimate(beats, pricingOverrides).totalUsd : 0,
   }
   for (const beat of beats) {
-    if (beat.error === null) summary.reached++
+    // A beat reached upstream when it got usage back (status 200), even if
+    // joining its child afterwards failed.
+    if (beat.status === 200) summary.reached++
     else summary.notReached++
     summary.inputTokens += beat.inputTokens ?? 0
     summary.outputTokens += beat.outputTokens ?? 0

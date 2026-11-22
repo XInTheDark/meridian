@@ -3418,13 +3418,18 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           configDir: transcriptConfigDir,
           projectDir: workingDirectory,
         })
+        // Set once the turn's key is known (see *Forked conversations*).
+        let namesForkSource = false
         const managedSdkAttemptLocators = (): TranscriptLocator[] => {
           // An auxiliary fork runs beside the conversation's own turn, which
           // holds the writer lease on the same source. The fork only reads the
           // source (the SDK copies it into the target), so it leases its target
           // alone; this process's GC pin (prepareManagedFork) keeps the source.
+          // A conversation forked from another (`x-meridian-fork-from`) shares
+          // its source with that conversation and with every other fork of it,
+          // so it leases its target alone for the same reason.
           const locators = [
-            requestMeta.auxiliaryRequest ? undefined : managedForkSource,
+            requestMeta.auxiliaryRequest || namesForkSource ? undefined : managedForkSource,
             managedForkTarget,
           ].filter((locator): locator is TranscriptLocator => locator !== undefined)
           return [...new Map(
@@ -3693,10 +3698,13 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         const absentGeneration = durableMappingAtTurn.status === "missing" && !durableMappingAtTurn.existing
           ? durableMappingAtTurn.generation
           : undefined
-        const seededFromFork = Boolean(
+        namesForkSource = Boolean(
           forkSourceId && agentSessionId && forkSourceId !== agentSessionId
           && durableMappingKey && durableMappingKey === profileSessionId
-          && absentGeneration && !isIndependentSession
+          && !isIndependentSession,
+        )
+        const seededFromFork = Boolean(
+          namesForkSource && forkSourceId && durableMappingKey && absentGeneration
           && await inDurableOrder(async () => seedSessionFromSource(
             durableMappingKey,
             mappingKeyOn(profile.id, forkSourceId),

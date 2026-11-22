@@ -320,6 +320,13 @@ published from rewritten history) is not copied, an existing lane mapping is
 never overwritten, and a lost generation race copies nothing: in each case the
 lane replays as it would have without the header.
 
+A fork only reads its source (the SDK copies it into the fork's target), and
+the source is shared with the conversation it came from and every other fork
+of it. So a turn that names a fork source takes the writer lease on its target
+alone, like an auxiliary fork: another fork of the same source, or the source
+conversation's own next turn, may run meanwhile. The source stays pinned by
+this process's GC pin and retained by every mapping that names it.
+
 On `/v1/responses`, a client-named session (`x-session-affinity`, then
 `x-session-id`) is the turn's key ahead of the Codex thread and
 `prompt_cache_key`, as on `/v1/chat/completions`: lanes that share one

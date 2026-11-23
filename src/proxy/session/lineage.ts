@@ -919,6 +919,27 @@ function classifyHistory(
     return { type: "undo", session: cached, prefixOverlap, rollbackUuid }
   }
 
+  // Middle excision / context replacement (e.g. Meowbert context_replace_calls):
+  // prefix intact, suffix intact (`suffixOverlap > 0`), conversation did not grow,
+  // replacement/edited content sits between the intact prefix and intact suffix
+  // (`prefixOverlap + suffixOverlap < messages.length`), ending on a user turn,
+  // and the SDK has an exact assistant rollback UUID at `prefixOverlap - 1`.
+  // Keeping `suffixOverlap === 0` on the `#817` undo-gap path above and requiring
+  // `prefixOverlap + suffixOverlap < messages.length` preserves both `#817`
+  // undo-gap divergence and regroup-drop divergence.
+  if (
+    prefixOverlap > 0 &&
+    suffixOverlap > 0 &&
+    messages.length <= cached.messageCount &&
+    prefixOverlap + suffixOverlap < messages.length &&
+    messages.at(-1)?.role === "user"
+  ) {
+    const rollbackUuid = cached.sdkMessageUuids?.[prefixOverlap - 1] || undefined
+    if (rollbackUuid) {
+      return { type: "undo", session: cached, prefixOverlap, rollbackUuid }
+    }
+  }
+
   // A growing history with a changed cached prefix is not proof that the old
   // SDK session contains the intervening turns. This happens when a request is
   // routed back to a stale proxy node (#692), and when a client-driven tool

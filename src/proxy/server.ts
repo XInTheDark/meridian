@@ -257,6 +257,12 @@ import { getConversationFingerprint, getPriorityAssignmentKey } from "./session/
 // Re-export for backwards compatibility (existing tests import from here)
 
 import {
+  buildToolUndoRewindMessages,
+  extractAssistantToolUseIds,
+  findForkSourceByPrefix,
+  resolveCheckpointRewind,
+} from "./session/prefixFork"
+import {
   lookupSession,
   seedSessionFromSource,
   FORK_FROM_HEADER,
@@ -3693,17 +3699,27 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         // A keyed conversation that names the one it was forked from starts
         // from that conversation's published session (see `session` spec,
         // *Forked conversations*). Only its first turn, and only on the same
-        // account: the source key is scoped like this one.
+        // account: the source key is scoped like this one. When an upstream
+        // proxy strips `x-meridian-fork-from` (or a stale mapping's pending
+        // checkpoint is behind a sibling/fallback key on the same account),
+        // fall back to matching a published session by message-hash prefix.
         const forkSourceId = c.req.header(FORK_FROM_HEADER)?.trim()
         const absentGeneration = durableMappingAtTurn.status === "missing" && !durableMappingAtTurn.existing
           ? durableMappingAtTurn.generation
           : undefined
-        namesForkSource = Boolean(
-          forkSourceId && agentSessionId && forkSourceId !== agentSessionId
-          && durableMappingKey && durableMappingKey === profileSessionId
-          && !isIndependentSession,
+        const earlyAllowTrailingSystemReminder = adapterBase === "claude-code" || adapterBase === "pi" || adapterBase === "opencode"
+        const earlyResumeContextHash = adapterBase === "opencode" ? openCodePrimaryAgentContextHash(
+          c.req.header("x-opencode-agent-mode"),
+          c.req.header("x-opencode-agent-name"),
+          sdkFeatures.clientSystemPrompt !== false,
+        ) : undefined
+        const canSeedKeyedFork = Boolean(
+          agentSessionId && durableMappingKey && durableMappingKey === profileSessionId && !isIndependentSession,
         )
-        const seededFromFork = Boolean(
+        namesForkSource = Boolean(
+          canSeedKeyedFork && forkSourceId && forkSourceId !== agentSessionId,
+        )
+        let seededFromFork = Boolean(
           namesForkSource && forkSourceId && durableMappingKey && absentGeneration
           && await inDurableOrder(async () => seedSessionFromSource(
             durableMappingKey,
@@ -3714,6 +3730,83 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         if (seededFromFork) {
           durableMappingAtTurn = lookupSharedSessionResult(durableMappingKey)
           claudeLog("session.fork_seeded", { found: durableMappingAtTurn.status === "found" })
+        } else if (canSeedKeyedFork && durableMappingKey && absentGeneration && lineageMessages.length >= 2) {
+          const inferredFork = findForkSourceByPrefix({
+            targetKey: durableMappingKey,
+            profileId: profile.id,
+            messages: lineageMessages,
+            expectedTranscript: { configDir: transcriptConfigDir, projectDir: workingDirectory },
+            resumeContextHash: earlyResumeContextHash,
+            allowTrailingSystemReminder: earlyAllowTrailingSystemReminder,
+          })
+          if (inferredFork) {
+            seededFromFork = Boolean(await inDurableOrder(async () => seedSessionFromSource(
+              durableMappingKey,
+              inferredFork.key,
+              absentGeneration,
+            )))
+            if (seededFromFork) {
+              namesForkSource = true
+              durableMappingAtTurn = lookupSharedSessionResult(durableMappingKey)
+              claudeLog("session.fork_seeded", {
+                found: durableMappingAtTurn.status === "found",
+                inferred: true,
+                matchedMessages: inferredFork.matchedMessages,
+                lineageType: inferredFork.lineageType,
+              })
+            }
+          }
+        } else if (
+          canSeedKeyedFork
+          && durableMappingKey
+          && durableMappingAtTurn.status === "found"
+          && durableMappingAtTurn.generation
+          && durableMappingAtTurn.session.passthroughToolCallIds?.length
+          && lineageMessages.length > durableMappingAtTurn.session.messageCount + 1
+        ) {
+          // A fallback key may have advanced the same conversation ahead of this
+          // key's stale unsettled checkpoint. Only scan when this key's own
+          // checkpoint is not settled by the incoming messages.
+          const ownDelta = lineageMessages.slice(durableMappingAtTurn.session.messageCount)
+          const ownSettled = Boolean(
+            coalesceCompleteToolResultContinuation(ownDelta, durableMappingAtTurn.session.passthroughToolCallIds, {
+              allowTrailingSystemReminder: earlyAllowTrailingSystemReminder,
+            })
+            || settlesCheckpointThenContinues(ownDelta, durableMappingAtTurn.session.passthroughToolCallIds, {
+              allowTrailingSystemReminder: earlyAllowTrailingSystemReminder,
+            }),
+          )
+          if (!ownSettled) {
+            const staleCount = durableMappingAtTurn.session.messageCount
+            const staleGeneration = durableMappingAtTurn.generation
+            const betterSource = findForkSourceByPrefix({
+              targetKey: durableMappingKey,
+              profileId: profile.id,
+              messages: lineageMessages,
+              expectedTranscript: { configDir: transcriptConfigDir, projectDir: workingDirectory },
+              resumeContextHash: earlyResumeContextHash,
+              allowTrailingSystemReminder: earlyAllowTrailingSystemReminder,
+              minMatchedMessages: staleCount + 1,
+            })
+            if (betterSource) {
+              seededFromFork = Boolean(await inDurableOrder(async () => seedSessionFromSource(
+                durableMappingKey,
+                betterSource.key,
+                staleGeneration,
+              )))
+              if (seededFromFork) {
+                namesForkSource = true
+                durableMappingAtTurn = lookupSharedSessionResult(durableMappingKey)
+                claudeLog("session.fork_seeded", {
+                  found: durableMappingAtTurn.status === "found",
+                  rebound: true,
+                  fromMessages: staleCount,
+                  matchedMessages: betterSource.matchedMessages,
+                  lineageType: betterSource.lineageType,
+                })
+              }
+            }
+          }
         }
         if (durableMappingAtTurn.status === "error") {
           throw new Error(`Shared session store is unavailable: ${durableMappingAtTurn.error.message}`)
@@ -4269,6 +4362,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // When resuming, only send new messages the SDK doesn't have.
       const allMessages = body.messages || []
       let messagesToConvert: typeof allMessages
+      let preserveToolResultsForRewind = false
+      let checkpointRewindPrefixLen: number | undefined
 
       if (passthroughToolCallAssistantUuid && durableCheckpointContinuation) {
         // Use the complete delta following the verified stored prefix. Never
@@ -4276,9 +4371,35 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
         messagesToConvert = durableCheckpointContinuation
       } else if ((isResume || isUndo) && cachedSession) {
         if (isUndo && undoRollbackUuid) {
-          // Undo with SDK rollback: the SDK will fork to the correct point,
-          // so we only need to send the new user message.
-          messagesToConvert = getLastUserMessage(allMessages)
+          // Undo with SDK rollback: the SDK will fork to the correct point.
+          // When rolling back to an assistant tool_use turn (for example a lane
+          // forking after its parent moved past the split call, or a middle
+          // context_replace excision), preserve the structured tool_result blocks
+          // that settle that assistant turn and flatten any preserved trailing turns.
+          const undoTail = lineageResult.type === "undo" ? allMessages.slice(lineageResult.prefixOverlap) : []
+          const undoRewindIdx = lineageResult.type === "undo" ? lineageResult.prefixOverlap - 1 : -1
+          const undoToolIds = undoRewindIdx >= 0 ? extractAssistantToolUseIds(allMessages[undoRewindIdx]) : []
+          if (undoToolIds.length > 0 && lineageResult.type === "undo") {
+            const undoCoalesced = buildToolUndoRewindMessages({
+              tail: undoTail,
+              expectedToolIds: undoToolIds,
+              allowTrailingSystemReminder: trailingSystemReminderOptions?.allowTrailingSystemReminder === true,
+              toolIndex: buildToolUseIndex(executionMessages),
+            })
+            if (undoCoalesced) {
+              messagesToConvert = undoCoalesced
+              preserveToolResultsForRewind = true
+            } else {
+              undoRollbackUuid = undefined
+              sdkUndo = false
+              resumeSessionId = undefined
+              messagesToConvert = executionMessages
+            }
+          } else if (undoTail.length > 1) {
+            messagesToConvert = undoTail
+          } else {
+            messagesToConvert = getLastUserMessage(allMessages)
+          }
         } else if (isResume) {
           if (
             resumeFrom !== undefined &&
@@ -4356,16 +4477,43 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           // messagesToConvert; clearing the marker drops the resumeSessionAt
           // rewind and the structured tool-result expectation.
         } else {
-          // Partial, late, duplicate, or unknown results get one safe fresh
-          // replay rather than an invalid SDK resume.
-          claudeLog("passthrough.checkpoint_replay", {
-            expectedToolIds: passthroughToolCallIds?.length ?? 0,
-            reason: "incomplete_or_mismatched_results",
+          // Before discarding the entire cached session, check whether we can
+          // rewind to the assistant turn immediately preceding the updated last
+          // user message (e.g. an interrupted run dropped the last assistant
+          // tool call and appended new user text to the preceding user turn).
+          const checkpointRewind = resolveCheckpointRewind({
+            cachedSession,
+            resumeFrom,
+            allMessages,
+            allowTrailingSystemReminder: Boolean(trailingSystemReminderOptions?.allowTrailingSystemReminder),
           })
-          isResume = false
-          resumeSessionId = undefined
-          passthroughToolCallAssistantUuid = undefined
-          messagesToConvert = executionMessages
+          if (checkpointRewind) {
+            checkpointRewindPrefixLen = checkpointRewind.prefixLen
+            if (checkpointRewind.kind === "tool_checkpoint") {
+              passthroughToolCallAssistantUuid = checkpointRewind.assistantUuid
+              messagesToConvert = checkpointRewind.messagesToConvert
+            } else {
+              passthroughToolCallAssistantUuid = undefined
+              undoRollbackUuid = checkpointRewind.assistantUuid
+              sdkUndo = true
+              messagesToConvert = checkpointRewind.messagesToConvert
+            }
+            claudeLog("passthrough.checkpoint_rewound", {
+              kind: checkpointRewind.kind,
+              prefixLen: checkpointRewind.prefixLen,
+            })
+          } else {
+            // Partial, late, duplicate, or unknown results get one safe fresh
+            // replay rather than an invalid SDK resume.
+            claudeLog("passthrough.checkpoint_replay", {
+              expectedToolIds: passthroughToolCallIds?.length ?? 0,
+              reason: "incomplete_or_mismatched_results",
+            })
+            isResume = false
+            resumeSessionId = undefined
+            passthroughToolCallAssistantUuid = undefined
+            messagesToConvert = executionMessages
+          }
         }
       }
 
@@ -4410,7 +4558,8 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
       // In particular, a continuation resumed at an assistant tool_use expects
       // the client's real tool_result blocks, not a flattened transcript string.
       const hasMultimodal = messagesToConvert?.some((m: any) => hasMultimodalContent(m.content))
-      const hasPassthroughToolResults = Boolean(passthroughToolCallAssistantUuid) &&
+      const preserveToolResults = Boolean(passthroughToolCallAssistantUuid || preserveToolResultsForRewind)
+      const hasPassthroughToolResults = preserveToolResults &&
         messagesToConvert?.some((m: any) =>
           m.role === "user" && Array.isArray(m.content) &&
           m.content.some((block: any) => block?.type === "tool_result"))
@@ -4620,7 +4769,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   type: "user" as const,
                   message: { role: "user" as const, content: normalizeStructuredUserContent(
                     stripCacheControlDeep(m.content),
-                    Boolean(passthroughToolCallAssistantUuid),
+                    preserveToolResults,
                     undefined,
                     renderReplayToolName,
                     !clientToolSearch,
@@ -4638,7 +4787,7 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
                   type: "user" as const,
                   message: { role: "user" as const, content: normalizeStructuredUserContent(
                     stripCacheControlDeep(m.content),
-                    Boolean(passthroughToolCallAssistantUuid),
+                    preserveToolResults,
                     undefined,
                     renderReplayToolName,
                     !clientToolSearch,
@@ -5234,7 +5383,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
           // are now also rejected at the entrypoint (#450) but the defensive
           // initializer keeps any future reentry safe.
           let sdkUuidMap: Array<string | null> = (isResume || sdkUndo) && cachedSession
-            ? inheritSdkUuids(cachedSession, lineageResult, lineageMessages)
+            ? (checkpointRewindPrefixLen !== undefined
+              ? (cachedSession.sdkMessageUuids ?? []).slice(0, checkpointRewindPrefixLen)
+              : inheritSdkUuids(cachedSession, lineageResult, lineageMessages))
             : []
           // Pad to current message count (the last user message has no UUID yet)
           while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
@@ -6395,7 +6546,9 @@ function createProxyServerWithAuthOwner(config: Partial<ProxyConfig>, authOwner:
             // ReadableStream's start() with `RangeError: Invalid array length`.
             // Cold-start requests with no messages are also rejected upstream now (#450).
             let sdkUuidMap: Array<string | null> = (isResume || sdkUndo) && cachedSession
-              ? inheritSdkUuids(cachedSession, lineageResult, lineageMessages)
+              ? (checkpointRewindPrefixLen !== undefined
+                ? (cachedSession.sdkMessageUuids ?? []).slice(0, checkpointRewindPrefixLen)
+                : inheritSdkUuids(cachedSession, lineageResult, lineageMessages))
               : []
             while (sdkUuidMap.length < allMessages.length) sdkUuidMap.push(null)
             let currentClientAssistantUuid: string | null = null

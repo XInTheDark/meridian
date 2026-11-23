@@ -792,12 +792,13 @@ export function seedSessionFromSource(
   expectedGeneration: StoredSessionGeneration,
 ): StoredSessionGeneration | false | Promise<StoredSessionGeneration | false> {
   if (key === sourceKey) return false
+  const epoch = cacheEpoch
   const source = lookupSharedSessionResult(sourceKey)
   if (source.status !== "found") return false
   const session = source.session
   if (!session.claudeSessionId || !session.lineageHash) return false
   if (session.currentTranscript && session.currentTranscript.sessionId !== session.claudeSessionId) return false
-  return storeSharedSession(
+  return mapStoreMutation(storeSharedSession(
     key,
     session.claudeSessionId,
     session.messageCount,
@@ -813,7 +814,10 @@ export function seedSessionFromSource(
     expectedGeneration,
     session.clientLineageHash ?? null,
     session.resumeContextHash ?? null,
-  )
+  ), (generation) => {
+    if (generation) afterSessionCacheCommit(() => { sessionCache.delete(key) }, epoch)
+    return generation
+  })
 }
 
 /**

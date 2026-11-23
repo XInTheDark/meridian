@@ -41,6 +41,9 @@ External plugins depend on these interfaces. **Changes require project owner app
 | `GET /v1/usage/quota/all` and `GET /v1/usage/quota` `extraUsage` amounts | `oauthUsage.ts`, `followUsage.ts`, `server.ts` | **Awaiting owner approval.** `monthlyLimit` and `usedCredits` are major units of `currency` (dollars for USD), converted from Anthropic's minor units; the added `exponent` (decimal places applied, normally 2) marks the converted shape, so a consumer that finds no `exponent` is reading an older Meridian that served cents. `usedCredits` may exceed `monthlyLimit`. |
 | `GET /profiles/list` response shape | `server.ts` | Profile management UI and CLI |
 | `GET /profiles/list` entries' `duplicateOf`, `duplicateBasis` and `factsRefresh` (`{state,since,at,error}` or `null`); a Claude entry's `email` from the account read | `server.ts`, `duplicateProfiles.ts`, `profileFactsRefresh.ts`, `organizationName.ts` | Owner-approved 2026-10-26 (#1446): additive, informational duplicate-account and post-sign-in status on every entry |
+| `GET /profiles/list` owned ChatGPT entries' `renewalRetryAt` (epoch ms or `null`) | `chatgpt/owned.ts`, `chatgpt/profiles.ts`, `chatgpt/profileSurface.ts` | Owner-approved 2026-11-22 (#1523): additive; when Meridian next renews a seat whose access token chatgpt.com refused, `null` otherwise, including once renewing stops a day after the first refusal |
+| `GET /profiles/list` entries' `authObtainedAt`, `authObtainedVia` (`login`/`observed`), `lastRefreshAt`, `firstUnauthedAt`, `unauthedReason` (`refresh_rejected`/`credentials_cleared`), each `null` when unknown; `loggedIn: false` once a refused grant's access token has expired; persistent `auth-lifecycle.json` and diagnostics category `auth` | `server.ts`, `authLifecycle.ts`, `tokenRefresh.ts` | Owner-approved 2026-11-22 (#1543, #1545): per-credential login history and logout records; history writes are best-effort and never awaited by a request; removing a profile deletes the history of the credential directories it removes; semantics in [profiles](../../docs/profiles.md#login-history) |
+| `seatRenewalHours` in `GET` / `PATCH /settings/api/chatgpt` `features` (seat id -> hours 6-240; a PATCH names profiles, `null` removes) and each `seats[]` entry's `renewalHours`; `/profiles/list` ChatGPT entries' `renewalHours` (number or `null`) and `renewals` (`[{at, outcome, cause?, issuedAt?, expiresAt?}]`, oldest first) | `chatgpt/features.ts`, `chatgpt/profileSurface.ts`, `chatgpt/refresh.ts`, `server.ts` | Owner-approved 2026-11-22 (#1546), with a six-hour minimum interval. Additive and present only where ChatGPT is enabled. `outcome` is `rotated`, `kept`, `refused` or `unverified`; a seat Meridian does not own lists `null` and `[]`. Nothing changes for a seat without an interval |
 | `GET /inflight` response shape and loopback-only access | `server.ts`, `inflight.ts` | Loopback supervisors observing `scope: client-http`; not a restart/admission barrier (#1216) |
 | `POST`/`DELETE /drain` request/response and local operator access | `server.ts`, `admissionHold.ts` | Owner-approved #1282: bounded per-instance generation delay; actual loopback/no forwarding/no Origin, configured API key required; aggregate `draining`/`drain` in `GET /inflight`, no restart guarantee |
 | `GET /readyz` status and `upstream-claude` check, `/health` `upstream.claude` block, loopback-only `PUT /upstream-reachability` | `server.ts`, `probes.ts`, `upstreamReachability.ts` | Instance-local native-Claude transport failure observations, default readiness policy and bounded operator override; owner-approved in #1281 |
@@ -114,6 +117,32 @@ of Anthropic numeric thinking budgets to Gemini effort variants. Response header
 and health expose adaptation; effective model IDs appear in responses and telemetry.
 Strict rejection remains the default; this does not provide native token limits.
 
+Antigravity token counts are planning estimates. `estimation.method` now
+identifies the ASCII byte/4 estimate plus a conservative non-ASCII UTF-8 byte
+allowance. Dense Unicode input can return a higher estimate and hit the per-step
+guard at a lower byte count than under the previous byte-only policy. The
+estimate does not include hidden CLI context or establish an exact tokenizer.
+Owner-approved 2026-11-22 (#1567), together with cold replay dropping whole older
+completed turns by default (with a note to the model) when history exceeds the
+budget, and one default 480,000-token context budget (`MERIDIAN_AGY_MAX_CONTEXT_TOKENS`) for every model until it is
+sized per model.
+
+When Antigravity Messages (`/v1/messages`, `/v1/messages/count_tokens`) drops
+unsupported hosted server tools without `input_schema` (`web_search_*`,
+`web_fetch_*`, `code_execution_*`), the response exposes the comma-separated
+`x-meridian-dropped-tools` header (the first 16 names) and total in
+`x-meridian-dropped-tools-count` (and emits one bounded warning per request) without
+changing `contractKey` or prompt rendering. Owner-approved 2026-11-22 (#1562),
+together with accepting and ignoring numeric `temperature`, `top_p` and `top_k`
+on the Antigravity path rather than rejecting them as #1074 did.
+
+`antigravity.turnMaxDurationMs` (environment `MERIDIAN_AGY_TURN_MAX_DURATION_MS`,
+default 7,200,000 ms) is an absolute per-turn deadline that includes client tool
+waits and is passed to agy as `--print-timeout`; `turnTimeoutMs` now bounds each
+model phase and pauses while client tools run. An agy process orphaned by a
+Meridian crash may therefore survive up to this cap (previously 300 s).
+Owner-approved 2026-11-22 (#1560).
+
 Antigravity Messages exact tool-result retries may return a bounded saved terminal
 text answer with `x-meridian-response-replayed: true`, preserving message ID and
 usage without a new model invocation. This cache is separate from OpenAI Responses
@@ -124,6 +153,19 @@ results prohibit redelivery of the old call. IDs are bounded and snapshots share
 the existing answer budget. Native-grant requests are excluded. This is bounded
 request idempotency, not an exactly-once client-tool execution contract; see the
 backend guide and integrations for supported retry boundaries (#1073).
+
+Antigravity intentionally relaxes #1074's changed-delivered-history/batch rule:
+a validated complete client history may retire and join its single idle owner
+before cold replay, with matching model/session/execution controls and native
+grants disabled. Known completed IDs without live owners may be included; active
+responses and mixed live owners still conflict. This recovers production Claude
+Code dropped-stream histories without re-executing the old pending call.
+Exact consumed-result continuations can retry after joined 401/408/429/499/5xx
+failures, before another client tool was delivered. Other deterministic failures
+remain 409; failed fingerprint persistence logs an error and preserves the
+original status and Retry-After. This is not exactly-once external execution. Owner-approved
+2026-11-22 (#1561), on the condition that the recovery never re-executes a client
+tool.
 
 Identified Antigravity Messages requests may set `x-meridian-replay-only: true`
 to recover a saved response without starting generation. The same fingerprint,
